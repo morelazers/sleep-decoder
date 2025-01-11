@@ -536,11 +536,35 @@ fn analyze_period_signals(
     period_num: usize,
 ) -> PeriodAnalysis {
     const SAMPLING_RATE: f32 = 500.0;
-    const SEGMENT_WIDTH: f32 = 120.0; // 120 second segments
-    const SEGMENT_OVERLAP: f32 = 0.0; // 0% overlap between segments
-    const SAMPLES_PER_SEGMENT: usize = (SEGMENT_WIDTH * SAMPLING_RATE) as usize;
-    const OVERLAP_SAMPLES: usize = (SAMPLES_PER_SEGMENT as f32 * SEGMENT_OVERLAP) as usize;
-    const STEP_SIZE: usize = SAMPLES_PER_SEGMENT - OVERLAP_SAMPLES;
+
+    // Get segment width and overlap from environment variables or use defaults
+    let segment_width: f32 = env::var("SEGMENT_WIDTH_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120.0); // Default: 120 second segments
+
+    let segment_overlap: f32 = env::var("SEGMENT_OVERLAP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0); // Default: 0% overlap
+
+    let samples_per_segment: usize = (segment_width * SAMPLING_RATE) as usize;
+    let overlap_samples: usize = (samples_per_segment as f32 * segment_overlap) as usize;
+    let step_size: usize = samples_per_segment - overlap_samples;
+
+    println!(
+        "\n  Processing segments with:
+    Width: {} seconds
+    Overlap: {}%
+    Samples per segment: {}
+    Overlap samples: {}
+    Step size: {} samples",
+        segment_width,
+        segment_overlap * 100.0,
+        samples_per_segment,
+        overlap_samples,
+        step_size
+    );
 
     // First, extract the entire signal for the specified side
     // Match side
@@ -585,14 +609,14 @@ fn analyze_period_signals(
 
     // Calculate number of segments with overlap
     let total_samples = cleaned_signal.len();
-    let num_segments = (total_samples - OVERLAP_SAMPLES) / STEP_SIZE;
+    let num_segments = (total_samples - overlap_samples) / step_size;
 
     println!(
         "\n  Processing {} segments of {} samples each ({}% overlap = {} samples)",
         num_segments,
-        SAMPLES_PER_SEGMENT,
-        SEGMENT_OVERLAP * 100.0,
-        OVERLAP_SAMPLES
+        samples_per_segment,
+        segment_overlap * 100.0,
+        overlap_samples
     );
 
     // Initialize CSV writer if environment variable is set
@@ -622,11 +646,11 @@ fn analyze_period_signals(
     };
 
     for segment_idx in 0..num_segments {
-        let start_sample = segment_idx * STEP_SIZE;
-        let end_sample = (start_sample + SAMPLES_PER_SEGMENT).min(total_samples);
+        let start_sample = segment_idx * step_size;
+        let end_sample = (start_sample + samples_per_segment).min(total_samples);
 
         // Skip if we don't have enough samples for a full segment
-        if end_sample - start_sample < SAMPLES_PER_SEGMENT / 2 {
+        if end_sample - start_sample < samples_per_segment / 2 {
             continue;
         }
 
