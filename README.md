@@ -5,7 +5,7 @@
 Make sure you have Rust installed.
 
 ```bash
-cargo run /path/ro/raws
+cargo run --release /path/ro/raws
 ```
 
 ## Build

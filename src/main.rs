@@ -98,6 +98,8 @@ struct PeriodAnalysis {
     peak_heart_rates: Vec<(DateTime<Utc>, f32)>, // Results from peak detection
     fft_heart_rates: Vec<(DateTime<Utc>, f32)>,  // Results from FFT analysis
     breathing_rates: Vec<(DateTime<Utc>, f32)>,  // Results from breathing analysis
+    side: String,
+    period_num: usize,
 }
 
 fn calculate_stats(data: &[i32]) -> (f32, f32) {
@@ -528,7 +530,11 @@ fn extract_raw_data_for_period(
 
 mod heart_analysis;
 
-fn analyze_period_signals(raw_data: &[RawPeriodData], side: &str) -> PeriodAnalysis {
+fn analyze_period_signals(
+    raw_data: &[RawPeriodData],
+    side: &str,
+    period_num: usize,
+) -> PeriodAnalysis {
     const SAMPLING_RATE: f32 = 500.0;
     const SEGMENT_WIDTH: f32 = 120.0; // 120 second segments
     const SEGMENT_OVERLAP: f32 = 0.0; // 0% overlap between segments
@@ -588,6 +594,32 @@ fn analyze_period_signals(raw_data: &[RawPeriodData], side: &str) -> PeriodAnaly
         SEGMENT_OVERLAP * 100.0,
         OVERLAP_SAMPLES
     );
+
+    // Initialize CSV writer if environment variable is set
+    let mut csv_writer = if let Ok(base_path) = env::var("CSV_OUTPUT") {
+        // Split the path into directory and filename parts
+        let path = std::path::Path::new(&base_path);
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("results");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("csv");
+
+        // Create new filename with side and period number
+        let filename = format!("{}_{}_period_{}.{}", stem, side, period_num, ext);
+        let full_path = dir.join(filename);
+
+        println!("Writing results to {}", full_path.display());
+        let file = std::fs::File::create(full_path).expect("Failed to create CSV file");
+        let mut writer = csv::Writer::from_writer(file);
+        writer
+            .write_record(&["timestamp", "peak_hr", "fft_hr", "breathing_rate"])
+            .expect("Failed to write CSV header");
+        Some(writer)
+    } else {
+        None
+    };
 
     for segment_idx in 0..num_segments {
         let start_sample = segment_idx * STEP_SIZE;
@@ -704,6 +736,8 @@ fn analyze_period_signals(raw_data: &[RawPeriodData], side: &str) -> PeriodAnaly
         peak_heart_rates,
         fft_heart_rates,
         breathing_rates,
+        side: side.to_string(),
+        period_num,
     };
 
     // Print the comparison
@@ -741,7 +775,7 @@ fn analyze_bed_presence_periods(
 
         if !raw_data.is_empty() {
             println!("\n  Analyzing left side period...");
-            let analysis = analyze_period_signals(&raw_data, "left");
+            let analysis = analyze_period_signals(&raw_data, "left", i);
         } else {
             println!("  No raw data found for this period!");
         }
@@ -766,7 +800,7 @@ fn analyze_bed_presence_periods(
 
         if !raw_data.is_empty() {
             println!("\n  Analyzing right side period...");
-            let analysis = analyze_period_signals(&raw_data, "right");
+            let analysis = analyze_period_signals(&raw_data, "right", i);
         } else {
             println!("  No raw data found for this period!");
         }
@@ -1129,6 +1163,35 @@ fn print_heart_rate_comparison(analysis: &PeriodAnalysis) {
     .max()
     .unwrap_or_default();
 
+    // Initialize CSV writer if environment variable is set
+    let mut csv_writer = if let Ok(base_path) = env::var("CSV_OUTPUT") {
+        // Split the path into directory and filename parts
+        let path = std::path::Path::new(&base_path);
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("results");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("csv");
+
+        // Create new filename with side and period number
+        let filename = format!(
+            "{}_{}_period_{}.{}",
+            stem, analysis.side, analysis.period_num, ext
+        );
+        let full_path = dir.join(filename);
+
+        println!("Writing results to {}", full_path.display());
+        let file = std::fs::File::create(full_path).expect("Failed to create CSV file");
+        let mut writer = csv::Writer::from_writer(file);
+        writer
+            .write_record(&["timestamp", "peak_hr", "fft_hr", "breathing_rate"])
+            .expect("Failed to write CSV header");
+        Some(writer)
+    } else {
+        None
+    };
+
     println!("\n  5-minute interval comparison:");
     println!("  Time      Peak HR    FFT HR    Breathing");
     println!("  ------------------------------------------");
@@ -1181,6 +1244,7 @@ fn print_heart_rate_comparison(analysis: &PeriodAnalysis) {
             None
         };
 
+        // Print to terminal
         print!(
             "  {:02}:{:02}     ",
             current_time.hour(),
@@ -1202,7 +1266,24 @@ fn print_heart_rate_comparison(analysis: &PeriodAnalysis) {
             None => println!("  --"),
         };
 
+        // Write to CSV if enabled
+        if let Some(writer) = csv_writer.as_mut() {
+            writer
+                .write_record(&[
+                    current_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    peak_avg.map(|v| v.to_string()).unwrap_or_default(),
+                    fft_avg.map(|v| v.to_string()).unwrap_or_default(),
+                    breathing_avg.map(|v| v.to_string()).unwrap_or_default(),
+                ])
+                .expect("Failed to write CSV record");
+        }
+
         current_time = next_time;
+    }
+
+    // Flush CSV writer if it exists
+    if let Some(mut writer) = csv_writer {
+        writer.flush().expect("Failed to flush CSV writer");
     }
 }
 
