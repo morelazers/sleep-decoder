@@ -145,47 +145,6 @@ fn rolling_mean(data: &[f32], window_size: f32, sample_rate: f32) -> Vec<f32> {
     result
 }
 
-/// Calculate adaptive threshold for peak detection
-fn calculate_adaptive_threshold(
-    data: &[f32],
-    rolling_mean: &[f32],
-    window_size: usize,
-) -> Vec<f32> {
-    let mut thresholds = vec![0.0; data.len()];
-    let half_window = window_size / 2;
-
-    for i in 0..data.len() {
-        // Get local window indices
-        let start = if i > half_window { i - half_window } else { 0 };
-        let end = (i + half_window + 1).min(data.len());
-
-        // Calculate local statistics
-        let window_data = &data[start..end];
-        let local_mean = window_data.iter().sum::<f32>() / window_data.len() as f32;
-        let local_std = (window_data
-            .iter()
-            .map(|&x| (x - local_mean).powi(2))
-            .sum::<f32>()
-            / window_data.len() as f32)
-            .sqrt();
-
-        // Adaptive threshold based on local signal characteristics
-        let base_threshold = rolling_mean[i];
-        let dynamic_component = local_std * 1.5; // Adjust based on local variance
-
-        // Use higher threshold if signal is noisy
-        let noise_factor = if local_std > local_mean * 0.1 {
-            1.2
-        } else {
-            1.0
-        };
-
-        thresholds[i] = (base_threshold + dynamic_component) * noise_factor;
-    }
-
-    thresholds
-}
-
 /// Detect peaks using moving average, matching HeartPy's implementation exactly
 fn detect_peaks(data: &[f32], rol_mean: &[f32], ma_perc: f32) -> (Vec<usize>, Vec<f32>) {
     // Calculate threshold exactly like HeartPy:
@@ -659,44 +618,6 @@ pub struct SegmentResults {
     pub breathing_regularity: f32, // Breathing pattern regularity score (0-1)
 }
 
-/// Combine two sensor signals by simple averaging
-pub fn combine_signals(signal1: &[i32], signal2: &[i32]) -> Vec<i32> {
-    signal1
-        .iter()
-        .zip(signal2.iter())
-        .map(|(&s1, &s2)| ((s1 as i64 + s2 as i64) / 2) as i32)
-        .collect()
-}
-
-/// Determine if a segment is valid based on quality metrics and measures
-pub fn is_valid_segment(
-    working_data: &WorkingData,
-    measures: &HeartMeasures,
-    quality: f32,
-) -> bool {
-    // Check if we have enough peaks
-    if working_data.peaklist.len() < 4 {
-        return false;
-    }
-
-    // Check if heart rate is in reasonable range (30-200 BPM)
-    if measures.bpm < 30.0 || measures.bpm > 200.0 {
-        return false;
-    }
-
-    // Check if quality is above threshold
-    if quality < 0.5 {
-        return false;
-    }
-
-    // Check if RR intervals are reasonable
-    if measures.sdnn > 300.0 || measures.rmssd > 300.0 {
-        return false;
-    }
-
-    true
-}
-
 /// Calculate breathing rate from RR intervals using frequency analysis
 pub fn calc_breathing(rr_list: &[f32], method: &str) -> Option<f32> {
     if rr_list.len() < 4 {
@@ -871,11 +792,6 @@ pub fn scale_data(data: &[f32], lower: f32, upper: f32) -> Vec<f32> {
         .collect()
 }
 
-// Add a default version that uses HeartPy's default parameters
-pub fn scale_data_default(data: &[f32]) -> Vec<f32> {
-    scale_data(data, 0.0, 1024.0)
-}
-
 /// Convert transfer function coefficients to second-order sections
 fn tf2sos(b: &[f32], a: &[f32]) -> Vec<[f32; 6]> {
     // For a second-order filter (like our notch filter), we just need one section
@@ -1027,6 +943,13 @@ pub fn analyze_heart_rate_fft(
 
 /// Analyze breathing rate using FFT on the scaled signal
 pub fn analyze_breathing_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f32> {
+    // Check if we have enough samples for reliable breathing rate detection
+    // Need at least 30 seconds of data for good frequency resolution
+    if signal.len() < (30.0 * sample_rate) as usize {
+        debug!("Window too small for reliable breathing rate detection. Need at least 30 seconds of data.");
+        return None;
+    }
+
     // Apply Hann window
     let window = create_hann_window(signal.len());
     let windowed_signal: Vec<f32> = signal
@@ -1050,10 +973,16 @@ pub fn analyze_breathing_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f3
 
     // Calculate frequency resolution
     let freq_resolution = sample_rate / signal.len() as f32;
+    debug!("Frequency resolution: {} Hz", freq_resolution);
 
-    // Look at magnitude spectrum in the breathing rate range (6-24 BPM = 0.1-0.4 Hz)
-    let min_bin = (0.1 / freq_resolution) as usize;
-    let max_bin = (0.4 / freq_resolution) as usize;
+    // Look at magnitude spectrum in the breathing rate range (8-20 BPM = 0.133-0.333 Hz)
+    let min_bin = (0.133 / freq_resolution) as usize;
+    let max_bin = (0.333 / freq_resolution) as usize;
+
+    debug!(
+        "Analyzing bins {} to {} for breathing rate",
+        min_bin, max_bin
+    );
 
     // Find peak in breathing rate range
     let mut max_magnitude = 0.0;
@@ -1071,9 +1000,14 @@ pub fn analyze_breathing_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f3
     let breaths_per_minute = peak_freq * 60.0;
 
     // Basic validation
-    if breaths_per_minute >= 6.0 && breaths_per_minute <= 24.0 {
+    if breaths_per_minute >= 8.0 && breaths_per_minute <= 20.0 {
+        debug!("Found breathing rate: {:.1} BPM", breaths_per_minute);
         Some(breaths_per_minute)
     } else {
+        debug!(
+            "Breathing rate {:.1} BPM outside valid range",
+            breaths_per_minute
+        );
         None
     }
 }

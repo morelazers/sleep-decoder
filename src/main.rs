@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use env_logger;
 use log::{debug, trace};
-use plotters::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_bytes;
 use std::env;
@@ -535,8 +534,10 @@ mod heart_analysis;
 fn analyse_sensor_data(
     signal: &[i32],
     raw_data: &[RawPeriodData],
-    samples_per_segment: usize,
-    step_size: usize,
+    samples_per_segment_hr: usize,
+    step_size_hr: usize,
+    samples_per_segment_br: usize,
+    step_size_br: usize,
     sensor_id: &str,
 ) -> PeriodAnalysis {
     let mut peak_heart_rates = Vec::new();
@@ -546,16 +547,16 @@ fn analyse_sensor_data(
     let mut signal_temporal_reality_scores = Vec::new();
     let mut prev_fft_hr = None;
 
-    // Process segments
+    // Process segments for heart rate analysis
     let total_samples = signal.len();
-    let num_segments = (total_samples - samples_per_segment) / step_size + 1;
+    let num_segments_hr = (total_samples - samples_per_segment_hr) / step_size_hr + 1;
 
-    for segment_idx in 0..num_segments {
-        let start_sample = segment_idx * step_size;
-        let end_sample = (start_sample + samples_per_segment).min(total_samples);
+    for segment_idx in 0..num_segments_hr {
+        let start_sample = segment_idx * step_size_hr;
+        let end_sample = (start_sample + samples_per_segment_hr).min(total_samples);
 
         // Skip if we don't have enough samples for a full segment
-        if end_sample - start_sample < samples_per_segment / 2 {
+        if end_sample - start_sample < samples_per_segment_hr / 2 {
             continue;
         }
 
@@ -569,7 +570,7 @@ fn analyse_sensor_data(
         // Convert to f32 for processing
         let segment_f32: Vec<f32> = cleaned_segment.iter().map(|&x| x as f32).collect();
 
-        // Scale the segment for breathing rate analysis
+        // Scale the segment
         let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
 
         // Calculate regularity scores on the cleaned signal after scaling
@@ -577,12 +578,6 @@ fn analyse_sensor_data(
             heart_analysis::calculate_regularity_score(&scaled_segment, 500.0);
         signal_amplitude_regularity_scores.push((segment_time, cv_score));
         signal_temporal_reality_scores.push((segment_time, temporal_regularity));
-
-        if let Some(breathing_rate) =
-            heart_analysis::analyze_breathing_rate_fft(&scaled_segment, 500.0)
-        {
-            breathing_rates.push((segment_time, breathing_rate));
-        }
 
         // Process for heart rate
         let processed_segment =
@@ -600,6 +595,39 @@ fn analyse_sensor_data(
         {
             fft_heart_rates.push((segment_time, fft_hr));
             prev_fft_hr = Some(fft_hr);
+        }
+    }
+
+    // Process segments for breathing rate analysis
+    let num_segments_br = (total_samples - samples_per_segment_br) / step_size_br + 1;
+
+    for segment_idx in 0..num_segments_br {
+        let start_sample = segment_idx * step_size_br;
+        let end_sample = (start_sample + samples_per_segment_br).min(total_samples);
+
+        // Skip if we don't have enough samples for a full segment
+        if end_sample - start_sample < samples_per_segment_br / 2 {
+            continue;
+        }
+
+        // Extract segment
+        let segment = &signal[start_sample..end_sample];
+        let segment_time = raw_data[start_sample / 500].timestamp;
+
+        // Remove outliers from the segment
+        let cleaned_segment = heart_analysis::interpolate_outliers(segment, 2);
+
+        // Convert to f32 for processing
+        let segment_f32: Vec<f32> = cleaned_segment.iter().map(|&x| x as f32).collect();
+
+        // Scale the segment for breathing rate analysis
+        let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
+
+        // Analyze breathing rate
+        if let Some(breathing_rate) =
+            heart_analysis::analyze_breathing_rate_fft(&scaled_segment, 500.0)
+        {
+            breathing_rates.push((segment_time, breathing_rate));
         }
     }
 
@@ -624,6 +652,50 @@ fn analyze_bed_presence_periods(
 
     println!("\nAnalyzing bed presence periods:");
 
+    // Get segment width and overlap from environment variables or use defaults
+    let segment_width_hr: f32 = env::var("HR_WINDOW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120.0); // Default: 120 second segments
+
+    let overlap_percent_hr: f32 = env::var("HR_WINDOW_OVERLAP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0); // Default: 0% overlap
+
+    // Get segment width and overlap from environment variables or use defaults
+    let segment_width_br: f32 = env::var("BR_WINDOW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120.0); // Default: 120 second segments
+
+    let overlap_percent_br: f32 = env::var("BR_WINDOW_OVERLAP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0); // Default: 0% overlap
+
+    let samples_per_segment_hr = (segment_width_hr * 500.0) as usize; // 500 Hz sampling rate
+    let overlap_samples_hr = (samples_per_segment_hr as f32 * overlap_percent_hr) as usize;
+    let step_size_hr = samples_per_segment_hr - overlap_samples_hr;
+
+    let samples_per_segment_br = (segment_width_br * 500.0) as usize; // 500 Hz sampling rate
+    let overlap_samples_br = (samples_per_segment_br as f32 * overlap_percent_br) as usize;
+    let step_size_br = samples_per_segment_br - overlap_samples_br;
+
+    println!("\n  Processing with:");
+    println!("    (hr) Segment width : {} seconds", segment_width_hr);
+    println!("    (hr) Overlap: {}%", overlap_percent_hr * 100.0);
+    println!("    (hr) Samples per segment: {}", samples_per_segment_hr);
+    println!("    (hr) Overlap samples: {}", overlap_samples_hr);
+    println!("    (hr) Step size: {} samples", step_size_hr);
+
+    println!("\n  --:");
+    println!("    (br) Segment width : {} seconds", segment_width_br);
+    println!("    (br) Overlap: {}%", overlap_percent_br * 100.0);
+    println!("    (br) Samples per segment: {}", samples_per_segment_br);
+    println!("    (br) Overlap samples: {}", overlap_samples_br);
+    println!("    (br) Step size: {} samples", step_size_br);
+
     // Analyze left side periods
     for (i, period) in left_periods.iter().enumerate() {
         println!("\nLeft side period {}", i + 1);
@@ -642,28 +714,6 @@ fn analyze_bed_presence_periods(
         println!("  Found {} raw data points", raw_data.len());
 
         if !raw_data.is_empty() {
-            // Get segment width and overlap from environment variables or use defaults
-            let segment_width: f32 = env::var("SEGMENT_WIDTH_SECONDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(120.0); // Default: 120 second segments
-
-            let overlap_percent: f32 = env::var("SEGMENT_OVERLAP_PERCENT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0); // Default: 0% overlap
-
-            let samples_per_segment = (segment_width * 500.0) as usize; // 500 Hz sampling rate
-            let overlap_samples = (samples_per_segment as f32 * overlap_percent) as usize;
-            let step_size = samples_per_segment - overlap_samples;
-
-            println!("\n  Processing with:");
-            println!("    Segment width: {} seconds", segment_width);
-            println!("    Overlap: {}%", overlap_percent * 100.0);
-            println!("    Samples per segment: {}", samples_per_segment);
-            println!("    Overlap samples: {}", overlap_samples);
-            println!("    Step size: {} samples", step_size);
-
             // Extract signals
             let signal1: Vec<i32> = raw_data
                 .iter()
@@ -684,19 +734,23 @@ fn analyze_bed_presence_periods(
                 .collect();
 
             println!("\n  Analyzing left side period...");
-            let sensor1_results = analyse_sensor_data(
+            let analysis1 = analyse_sensor_data(
                 &signal1,
                 &raw_data,
-                samples_per_segment,
-                step_size,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
                 &format!("left_sensor1_{}", i),
             );
 
-            let sensor2_results = analyse_sensor_data(
+            let analysis2 = analyse_sensor_data(
                 &signal2,
                 &raw_data,
-                samples_per_segment,
-                step_size,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
                 &format!("left_sensor2_{}", i),
             );
 
@@ -707,29 +761,31 @@ fn analyze_bed_presence_periods(
                 .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
                 .collect();
 
-            let combined_results = analyse_sensor_data(
+            let analysis_combined = analyse_sensor_data(
                 &combined_signal,
                 &raw_data,
-                samples_per_segment,
-                step_size,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
                 &format!("left_combined_{}", i),
             );
 
             println!("\nLeft Sensor 1 Results:");
-            print_detailed_comparison(&sensor1_results, "Left Sensor 1");
+            print_detailed_comparison(&analysis1, "Left Sensor 1");
 
             println!("\nLeft Sensor 2 Results:");
-            print_detailed_comparison(&sensor2_results, "Left Sensor 2");
+            print_detailed_comparison(&analysis2, "Left Sensor 2");
 
             println!("\nLeft Combined Results:");
-            print_detailed_comparison(&combined_results, "Left Combined");
+            print_detailed_comparison(&analysis_combined, "Left Combined");
 
             if let Ok(base_path) = env::var("CSV_OUTPUT") {
                 for (i, period) in left_periods.iter().enumerate() {
                     // Write left side results
-                    write_analysis_to_csv(&base_path, "left", i, &sensor1_results)?;
-                    write_analysis_to_csv(&base_path, "left2", i, &sensor2_results)?;
-                    write_analysis_to_csv(&base_path, "left_combined", i, &combined_results)?;
+                    write_analysis_to_csv(&base_path, "left", i, &analysis1)?;
+                    write_analysis_to_csv(&base_path, "left2", i, &analysis2)?;
+                    write_analysis_to_csv(&base_path, "left_combined", i, &analysis_combined)?;
                 }
             }
         } else {
@@ -754,28 +810,6 @@ fn analyze_bed_presence_periods(
             println!("  Found {} raw data points", raw_data.len());
 
             if !raw_data.is_empty() {
-                // Get segment width and overlap from environment variables or use defaults
-                let segment_width: f32 = env::var("SEGMENT_WIDTH_SECONDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(120.0); // Default: 120 second segments
-
-                let overlap_percent: f32 = env::var("SEGMENT_OVERLAP_PERCENT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0); // Default: 0% overlap
-
-                let samples_per_segment = (segment_width * 500.0) as usize; // 500 Hz sampling rate
-                let overlap_samples = (samples_per_segment as f32 * overlap_percent) as usize;
-                let step_size = samples_per_segment - overlap_samples;
-
-                println!("\n  Processing with:");
-                println!("    Segment width: {} seconds", segment_width);
-                println!("    Overlap: {}%", overlap_percent * 100.0);
-                println!("    Samples per segment: {}", samples_per_segment);
-                println!("    Overlap samples: {}", overlap_samples);
-                println!("    Step size: {} samples", step_size);
-
                 // Extract signals
                 let signal1: Vec<i32> = raw_data
                     .iter()
@@ -796,19 +830,23 @@ fn analyze_bed_presence_periods(
                     .collect();
 
                 println!("\n  Analyzing right side period...");
-                let sensor1_results = analyse_sensor_data(
+                let analysis1 = analyse_sensor_data(
                     &signal1,
                     &raw_data,
-                    samples_per_segment,
-                    step_size,
+                    samples_per_segment_hr,
+                    step_size_hr,
+                    samples_per_segment_br,
+                    step_size_br,
                     &format!("right_sensor1_{}", i),
                 );
 
-                let sensor2_results = analyse_sensor_data(
+                let analysis2 = analyse_sensor_data(
                     &signal2,
                     &raw_data,
-                    samples_per_segment,
-                    step_size,
+                    samples_per_segment_hr,
+                    step_size_hr,
+                    samples_per_segment_br,
+                    step_size_br,
                     &format!("right_sensor2_{}", i),
                 );
 
@@ -819,29 +857,31 @@ fn analyze_bed_presence_periods(
                     .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
                     .collect();
 
-                let combined_results = analyse_sensor_data(
+                let analysis_combined = analyse_sensor_data(
                     &combined_signal,
                     &raw_data,
-                    samples_per_segment,
-                    step_size,
+                    samples_per_segment_hr,
+                    step_size_hr,
+                    samples_per_segment_br,
+                    step_size_br,
                     &format!("right_combined_{}", i),
                 );
 
                 println!("\nRight Sensor 1 Results:");
-                print_detailed_comparison(&sensor1_results, "Right Sensor 1");
+                print_detailed_comparison(&analysis1, "Right Sensor 1");
 
                 println!("\nRight Sensor 2 Results:");
-                print_detailed_comparison(&sensor2_results, "Right Sensor 2");
+                print_detailed_comparison(&analysis2, "Right Sensor 2");
 
                 println!("\nRight Combined Results:");
-                print_detailed_comparison(&combined_results, "Right Combined");
+                print_detailed_comparison(&analysis_combined, "Right Combined");
 
                 if let Ok(base_path) = env::var("CSV_OUTPUT") {
                     for (i, period) in right_periods.iter().enumerate() {
                         // Write right side results
-                        write_analysis_to_csv(&base_path, "right", i, &sensor1_results)?;
-                        write_analysis_to_csv(&base_path, "right2", i, &sensor2_results)?;
-                        write_analysis_to_csv(&base_path, "right_combined", i, &combined_results)?;
+                        write_analysis_to_csv(&base_path, "right", i, &analysis1)?;
+                        write_analysis_to_csv(&base_path, "right2", i, &analysis2)?;
+                        write_analysis_to_csv(&base_path, "right_combined", i, &analysis_combined)?;
                     }
                 }
             } else {
