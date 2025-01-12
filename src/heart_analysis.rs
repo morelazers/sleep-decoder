@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use log::{debug, trace};
 use rustfft::{num_complex::Complex, FftPlanner};
 use sci_rs::signal::filter::{design::Sos, sosfiltfilt_dyn};
@@ -565,7 +566,20 @@ pub fn process(signal: &[f32], sample_rate: f32, window_size: f32) -> (WorkingDa
     // Check peaks and get confidence score
     let confidence = check_peaks(&mut working_data);
 
-    // Calculate time-series measures using the corrected RR list
+    // Filter out invalid peaks using binary_peaklist
+    let valid_peaks: Vec<usize> = working_data
+        .peaklist
+        .iter()
+        .zip(working_data.binary_peaklist.iter())
+        .filter(|(_, &valid)| valid == 1)
+        .map(|(&peak, _)| peak)
+        .collect();
+
+    // Recalculate RR intervals using only valid peaks
+    let (valid_rr_list, valid_rr_indices) = calc_rr(&valid_peaks, sample_rate);
+    working_data.rr_list_cor = valid_rr_list;
+
+    // Calculate time-series measures using only the valid RR intervals
     let mut measures = calc_ts_measures(
         &working_data.rr_list_cor,
         &working_data.rr_diff,
@@ -639,8 +653,10 @@ pub struct SegmentResults {
     pub segment_size: usize, // Size of the segment
     pub working_data: WorkingData,
     pub measures: HeartMeasures,
-    pub quality: f32, // Signal quality metric (0-1)
-    pub valid: bool,  // Whether the segment is considered valid
+    pub quality: f32,              // Signal quality metric (0-1)
+    pub valid: bool,               // Whether the segment is considered valid
+    pub cv_score: f32,             // Signal stability score (0-1, higher is more stable)
+    pub breathing_regularity: f32, // Breathing pattern regularity score (0-1)
 }
 
 /// Combine two sensor signals by simple averaging
@@ -919,8 +935,12 @@ fn update_rr(working_data: &mut WorkingData) {
     working_data.rr_sqdiff = rr_sqdiff;
 }
 
-/// Analyze heart rate using FFT
-pub fn analyze_heart_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f32> {
+/// Analyze heart rate using FFT, considering previous heart rate for continuity
+pub fn analyze_heart_rate_fft(
+    signal: &[f32],
+    sample_rate: f32,
+    prev_hr: Option<f32>,
+) -> Option<f32> {
     // Apply Hann window
     let window = create_hann_window(signal.len());
     let windowed_signal: Vec<f32> = signal
@@ -945,31 +965,64 @@ pub fn analyze_heart_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f32> {
     // Calculate frequency resolution
     let freq_resolution = sample_rate / signal.len() as f32;
 
-    // Look at magnitude spectrum in the heart rate range (40-80 BPM = 0.67-1.33 Hz)
-    let min_bin = (0.67 / freq_resolution) as usize;
+    // Look at magnitude spectrum in the heart rate range (45-80 BPM = 0.75-1.33 Hz)
+    let min_bin = (0.75 / freq_resolution) as usize;
     let max_bin = (1.33 / freq_resolution) as usize;
 
-    // Find peak in heart rate range
-    let mut max_magnitude = 0.0;
-    let mut peak_freq = 0.0;
-
-    for bin in min_bin..=max_bin {
+    // Find all peaks in the heart rate range
+    let mut peaks = Vec::new();
+    for bin in min_bin + 1..=max_bin - 1 {
         let magnitude = (buffer[bin].norm_sqr() as f32).sqrt();
-        if magnitude > max_magnitude {
-            max_magnitude = magnitude;
-            peak_freq = bin as f32 * freq_resolution;
+        let prev_magnitude = (buffer[bin - 1].norm_sqr() as f32).sqrt();
+        let next_magnitude = (buffer[bin + 1].norm_sqr() as f32).sqrt();
+
+        // Check if this is a local maximum
+        if magnitude > prev_magnitude && magnitude > next_magnitude {
+            let freq = bin as f32 * freq_resolution;
+            let bpm = freq * 60.0;
+            peaks.push((bpm, magnitude));
         }
     }
 
-    // Convert peak frequency to BPM
-    let bpm = peak_freq * 60.0;
+    // Sort peaks by magnitude
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    // Basic validation
-    if bpm >= 40.0 && bpm <= 180.0 {
-        Some(bpm)
-    } else {
-        None
+    // // If we have a previous heart rate, try to find a peak close to it
+    if let Some(prev_hr) = prev_hr {
+        // Look at top 3 peaks (if available) and choose the one closest to previous HR
+        let top_peaks: Vec<(f32, f32)> = peaks
+            .iter()
+            .take(3)
+            .filter(|(bpm, magnitude)| {
+                // Must be at least 20% of strongest peak's magnitude
+                *magnitude >= peaks[0].1 * 0.2
+            })
+            .cloned()
+            .collect();
+
+        if !top_peaks.is_empty() {
+            // Find the peak closest to previous heart rate
+            let closest_peak = top_peaks.iter().min_by(|(bpm1, _), (bpm2, _)| {
+                let diff1 = (bpm1 - prev_hr).abs();
+                let diff2 = (bpm2 - prev_hr).abs();
+                diff1.partial_cmp(&diff2).unwrap()
+            });
+
+            if let Some(&(bpm, _)) = closest_peak {
+                // Only accept if it's not too far from previous HR (max 15 BPM difference)
+                if (bpm - prev_hr).abs() <= 15.0 {
+                    return Some(bpm);
+                }
+            }
+        }
     }
+
+    // If no previous HR or no suitable peaks found near previous HR,
+    // return the strongest peak if it's in valid range
+    peaks
+        .first()
+        .map(|&(bpm, _)| bpm)
+        .filter(|&bpm| bpm >= 40.0 && bpm <= 180.0)
 }
 
 /// Analyze breathing rate using FFT on the scaled signal
@@ -1023,4 +1076,148 @@ pub fn analyze_breathing_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f3
     } else {
         None
     }
+}
+
+/// Calculate regularity scores for a signal segment.
+/// Returns a tuple of (amplitude_regularity, temporal_regularity)
+/// Both scores are in range 0-1, where higher values indicate more regular signals
+pub fn calculate_regularity_score(signal: &[f32], sample_rate: f32) -> (f32, f32) {
+    // Apply Hann window to reduce spectral leakage
+    let window = create_hann_window(signal.len());
+    let windowed_signal: Vec<f32> = signal
+        .iter()
+        .zip(window.iter())
+        .map(|(&s, &w)| s * w)
+        .collect();
+
+    // Prepare FFT
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(signal.len());
+    let mut buffer: Vec<Complex<f32>> = windowed_signal
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .collect();
+
+    // Perform FFT
+    fft.process(&mut buffer);
+
+    // Calculate power spectrum
+    let mut power_spectrum: Vec<f32> = buffer.iter().map(|x| x.norm_sqr() as f32).collect();
+
+    // Only look at first half (due to symmetry)
+    power_spectrum.truncate(signal.len() / 2);
+
+    // Calculate total power
+    let total_power: f32 = power_spectrum.iter().sum();
+
+    // Skip if total power is too low (likely a flat signal)
+    if total_power < 1e-6 {
+        return (0.0, 0.0);
+    }
+
+    // Sort power spectrum for percentile calculations
+    let mut sorted_power = power_spectrum.clone();
+    sorted_power.sort_by(|a, b| b.partial_cmp(a).unwrap()); // Sort in descending order
+
+    // Calculate power ratio: top 3 peaks vs total power
+    let power_in_top_peaks: f32 = sorted_power.iter().take(3).sum();
+    let power_ratio = power_in_top_peaks / total_power;
+
+    // More discriminating spectral concentration score
+    // Score of 1.0 means top 3 peaks contain 50% of total power
+    // Score of 0.0 means top 3 peaks contain 5% or less of total power
+    let spectral_concentration = ((power_ratio - 0.05) / 0.45).clamp(0.0, 1.0);
+
+    // Calculate normalized power distribution
+    let normalized_power: Vec<f32> = power_spectrum.iter().map(|&p| p / total_power).collect();
+
+    // Calculate spectral flatness (geometric mean / arithmetic mean)
+    let geometric_mean: f32 = normalized_power
+        .iter()
+        .filter(|&&p| p > 1e-10) // Avoid log(0)
+        .map(|&p| p.ln())
+        .sum::<f32>()
+        .exp();
+    let arithmetic_mean: f32 = normalized_power.iter().sum::<f32>() / normalized_power.len() as f32;
+
+    // Spectral flatness will be close to 1 for white noise and close to 0 for pure tones
+    let flatness = geometric_mean / arithmetic_mean;
+
+    // Convert flatness to regularity score (invert and scale)
+    let regularity = (1.0 - flatness).powf(0.5); // Square root to make it more sensitive
+
+    (spectral_concentration, regularity)
+}
+
+/// Interpolate missing values and smooth the time series
+/// Returns interpolated and smoothed values
+pub fn interpolate_and_smooth(
+    timestamps: &[DateTime<Utc>],
+    values: &[(DateTime<Utc>, f32)],
+    window_size: usize,
+) -> Vec<(DateTime<Utc>, f32)> {
+    if values.is_empty() || timestamps.is_empty() {
+        return Vec::new();
+    }
+
+    // First, interpolate missing values
+    let mut interpolated: Vec<(DateTime<Utc>, f32)> = Vec::with_capacity(timestamps.len());
+
+    for &timestamp in timestamps {
+        // Find the value at this timestamp or interpolate
+        let value = match values.binary_search_by_key(&timestamp, |&(t, _)| t) {
+            Ok(idx) => values[idx].1,
+            Err(idx) => {
+                if idx == 0 {
+                    // Before first value, use first value
+                    values[0].1
+                } else if idx >= values.len() {
+                    // After last value, use last value
+                    values[values.len() - 1].1
+                } else {
+                    // Interpolate between two points
+                    let (t1, v1) = values[idx - 1];
+                    let (t2, v2) = values[idx];
+
+                    // Calculate weights based on time differences
+                    let total_duration = (t2 - t1).num_seconds() as f32;
+                    let first_duration = (timestamp - t1).num_seconds() as f32;
+
+                    // Linear interpolation
+                    let weight = first_duration / total_duration;
+                    v1 + (v2 - v1) * weight
+                }
+            }
+        };
+        interpolated.push((timestamp, value));
+    }
+
+    // Then apply moving average smoothing
+    let mut smoothed = Vec::with_capacity(interpolated.len());
+    let half_window = window_size / 2;
+
+    for i in 0..interpolated.len() {
+        let start = i.saturating_sub(half_window);
+        let end = (i + half_window + 1).min(interpolated.len());
+        let window = &interpolated[start..end];
+
+        // Calculate Gaussian-weighted moving average
+        let mut weighted_sum = 0.0;
+        let mut weight_sum = 0.0;
+
+        let sigma = (window.len() as f32) / 4.0; // Controls how quickly weights fall off
+        let center = window.len() as f32 / 2.0;
+
+        for (j, &(_, value)) in window.iter().enumerate() {
+            let x = (j as f32 - center) / sigma;
+            let weight = (-0.5 * x * x).exp(); // Gaussian weight
+            weighted_sum += value * weight;
+            weight_sum += weight;
+        }
+
+        let smoothed_value = weighted_sum / weight_sum;
+        smoothed.push((interpolated[i].0, smoothed_value));
+    }
+
+    smoothed
 }
