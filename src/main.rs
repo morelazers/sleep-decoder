@@ -104,7 +104,7 @@ struct PeriodAnalysis {
 
 fn calculate_stats(data: &[i32]) -> (f32, f32) {
     // First remove outliers from raw data
-    let cleaned_data = heart_analysis::clamp_outliers(data, 2);
+    let cleaned_data = heart_analysis::interpolate_outliers(data, 2);
 
     let n = cleaned_data.len() as f32;
     if n == 0.0 {
@@ -566,84 +566,114 @@ fn analyze_period_signals(
         step_size
     );
 
-    // First, extract the entire signal for the specified side
-    // Match side
-    let combined_signal: Vec<i32> =
-        match side {
-            "left" => raw_data
-                .iter()
-                .flat_map(|d| {
-                    d.left1
-                        .chunks_exact(4)
-                        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .zip(d.left2.chunks_exact(4).map(|chunk| {
-                            i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        }))
-                        .map(|(s1, s2)| ((s1 as i64 + s2 as i64) / 2) as i32)
+    // Extract signals based on side
+    let (signal1, signal2) = match side {
+        "left" => {
+            let s1: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.left1.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                 })
-                .collect(),
-            "right" => raw_data
-                .iter()
-                .flat_map(|d| {
-                    d.right1
-                        .chunks_exact(4)
-                        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .zip(d.right2.chunks_exact(4).map(|chunk| {
-                            i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        }))
-                        .map(|(s1, s2)| ((s1 as i64 + s2 as i64) / 2) as i32)
+            }).collect();
+            let s2: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.left2.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                 })
-                .collect(),
-            _ => unreachable!(),
-        };
+            }).collect();
+            (s1, s2)
+        },
+        "right" => {
+            let s1: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.right1.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                })
+            }).collect();
+            let s2: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.right2.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                })
+            }).collect();
+            (s1, s2)
+        },
+        _ => unreachable!(),
+    };
 
-    // Remove outliers from the combined signal
-    let percent_outliers_to_remove = 4;
-    let cleaned_signal =
-        heart_analysis::clamp_outliers(&combined_signal, percent_outliers_to_remove);
+    // Analyze sensor1
+    println!("\nAnalyzing {} sensor 1:", side);
+    let sensor1_results = analyze_single_sensor(
+        &signal1,
+        raw_data,
+        samples_per_segment,
+        step_size,
+        &format!("{}_sensor1", side),
+    );
+    print_analysis_results(&sensor1_results, &format!("{} Sensor 1", side));
 
-    // Process data segment by segment
+    // Analyze sensor2
+    println!("\nAnalyzing {} sensor 2:", side);
+    let sensor2_results = analyze_single_sensor(
+        &signal2,
+        raw_data,
+        samples_per_segment,
+        step_size,
+        &format!("{}_sensor2", side),
+    );
+    print_analysis_results(&sensor2_results, &format!("{} Sensor 2", side));
+
+    // Analyze combined signals
+    println!("\nAnalyzing {} combined signals:", side);
+    let combined_signal: Vec<i32> = signal1.iter()
+        .zip(signal2.iter())
+        .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+        .collect();
+    let combined_results = analyze_single_sensor(
+        &combined_signal,
+        raw_data,
+        samples_per_segment,
+        step_size,
+        &format!("{}_combined", side),
+    );
+    print_analysis_results(&combined_results, &format!("{} Combined", side));
+
+    // Return the combined results as the main analysis
+    combined_results
+}
+
+fn analyze_single_sensor(
+    signal: &[i32],
+    raw_data: &[RawPeriodData],
+    samples_per_segment: usize,
+    step_size: usize,
+    sensor_id: &str,
+) -> PeriodAnalysis {
     let mut peak_heart_rates = Vec::new();
     let mut fft_heart_rates = Vec::new();
     let mut breathing_rates = Vec::new();
-
-    // Calculate number of segments with overlap
-    let total_samples = cleaned_signal.len();
-    let num_segments = (total_samples - overlap_samples) / step_size;
-
-    println!(
-        "\n  Processing {} segments of {} samples each ({}% overlap = {} samples)",
-        num_segments,
-        samples_per_segment,
-        segment_overlap * 100.0,
-        overlap_samples
-    );
 
     // Initialize CSV writer if environment variable is set
     let mut csv_writer = if let Ok(base_path) = env::var("CSV_OUTPUT") {
         // Split the path into directory and filename parts
         let path = std::path::Path::new(&base_path);
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("results");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("results");
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("csv");
 
-        // Create new filename with side and period number
-        let filename = format!("{}_{}_period_{}.{}", stem, side, period_num, ext);
+        // Create new filename with sensor id
+        let filename = format!("{}_{}.{}", stem, sensor_id, ext);
         let full_path = dir.join(filename);
 
         println!("Writing results to {}", full_path.display());
         let file = std::fs::File::create(full_path).expect("Failed to create CSV file");
         let mut writer = csv::Writer::from_writer(file);
-        writer
-            .write_record(&["timestamp", "peak_hr", "fft_hr", "breathing_rate"])
+        writer.write_record(&["timestamp", "peak_hr", "fft_hr", "breathing_rate"])
             .expect("Failed to write CSV header");
         Some(writer)
     } else {
         None
     };
+
+    // Process segments
+    let total_samples = signal.len();
+    let num_segments = (total_samples - samples_per_segment) / step_size + 1;
 
     for segment_idx in 0..num_segments {
         let start_sample = segment_idx * step_size;
@@ -655,119 +685,64 @@ fn analyze_period_signals(
         }
 
         // Extract segment
-        let segment = &cleaned_signal[start_sample..end_sample];
+        let segment = &signal[start_sample..end_sample];
+
+        // Remove outliers from the segment
+        let cleaned_segment = heart_analysis::interpolate_outliers(segment, 2);
 
         // Convert to f32 for processing
-        let segment_f32: Vec<f32> = segment.iter().map(|&x| x as f32).collect();
+        let segment_f32: Vec<f32> = cleaned_segment.iter().map(|&x| x as f32).collect();
 
-        // Process segment: scale, remove baseline wander
+        // Scale the segment for breathing rate analysis
         let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
-
-        // Analyze breathing rate from scaled signal
-        if let Some(breathing_rate) =
-            heart_analysis::analyze_breathing_rate_fft(&scaled_segment, SAMPLING_RATE)
-        {
+        if let Some(breathing_rate) = heart_analysis::analyze_breathing_rate_fft(&scaled_segment, 500.0) {
             let segment_time = raw_data[start_sample / 500].timestamp;
             breathing_rates.push((segment_time, breathing_rate));
-            debug!(
-                "  Breathing rate at timestamp: {} - {:.1} breaths/min",
-                segment_time, breathing_rate
-            );
         }
 
-        let processed_segment =
-            heart_analysis::remove_baseline_wander(&scaled_segment, SAMPLING_RATE, 0.05);
+        // Process for heart rate
+        let processed_segment = heart_analysis::remove_baseline_wander(&scaled_segment, 500.0, 0.05);
+        let (working_data, measures) = heart_analysis::process(&processed_segment, 500.0, 0.75);
 
-        // Remove the outliers from the processed segment
-        let processed_i32: Vec<i32> = processed_segment.iter().map(|&x| x as i32).collect();
-        let cleaned_segment = heart_analysis::clamp_outliers(&processed_i32, 1);
+        let segment_time = raw_data[start_sample / 500].timestamp;
 
-        let bpm_fft = heart_analysis::analyze_heart_rate_fft(&cleaned_segment, SAMPLING_RATE);
-        let segment_start_idx = (start_sample / 500) as usize; // Convert samples to data indices
-        debug!(
-            "  Heart rate (FFT analysis) at timestamp: {} - {} BPM",
-            raw_data[segment_start_idx].timestamp,
-            bpm_fft.unwrap_or(0.0)
-        );
-
-        // Plot the signals
-        if env::var("PLOT_SIGNALS").is_ok() {
-            if let Err(e) = plot_signal_stages(
-                &segment_f32,
-                &scaled_segment,
-                &processed_segment,
-                &cleaned_segment,
-                segment_idx,
-            ) {
-                println!("  Failed to generate plot: {}", e);
-            }
-        }
-
-        // Process this segment
-        let (working_data, measures) =
-            heart_analysis::process(&processed_segment, SAMPLING_RATE, 0.75);
-
-        let is_valid_segment = heart_analysis::is_valid_segment(&working_data, &measures, 0.5);
-
-        // Store FFT results
-        if let Some(bpm_fft) =
-            heart_analysis::analyze_heart_rate_fft(&cleaned_segment, SAMPLING_RATE)
-        {
-            let segment_time = raw_data[segment_start_idx].timestamp;
-            fft_heart_rates.push((segment_time, bpm_fft));
-        }
-
-        // Store peak detection results (only if confident)
-        if measures.confidence > 0.5 && is_valid_segment {
-            let segment_time = raw_data[segment_start_idx].timestamp;
+        // Store peak detection results if confident
+        if measures.confidence > 0.5 {
             peak_heart_rates.push((segment_time, measures.bpm));
         }
+
+        // Store FFT results
+        if let Some(fft_hr) = heart_analysis::analyze_heart_rate_fft(&processed_segment, 500.0) {
+            fft_heart_rates.push((segment_time, fft_hr));
+        }
+
+        // Write to CSV if enabled
+        if let Some(writer) = csv_writer.as_mut() {
+            let peak_hr = peak_heart_rates.last().map(|(_, hr)| hr.to_string()).unwrap_or_default();
+            let fft_hr = fft_heart_rates.last().map(|(_, hr)| hr.to_string()).unwrap_or_default();
+            let br = breathing_rates.last().map(|(_, br)| br.to_string()).unwrap_or_default();
+            let record = [
+                segment_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                peak_hr,
+                fft_hr,
+                br,
+            ];
+            writer.write_record(&record).expect("Failed to write CSV record");
+        }
     }
 
-    // Print analysis results
-    println!("\n  Analysis Results:");
-    if !peak_heart_rates.is_empty() {
-        let avg_peak_hr: f32 =
-            peak_heart_rates.iter().map(|(_, hr)| hr).sum::<f32>() / peak_heart_rates.len() as f32;
-        println!(
-            "    Average Heart Rate (Peak Detection): {:.1} BPM",
-            avg_peak_hr
-        );
-        println!(
-            "    Valid peak detection segments: {}",
-            peak_heart_rates.len()
-        );
+    // Ensure CSV is flushed
+    if let Some(mut writer) = csv_writer {
+        writer.flush().expect("Failed to flush CSV writer");
     }
 
-    if !fft_heart_rates.is_empty() {
-        let avg_fft_hr: f32 =
-            fft_heart_rates.iter().map(|(_, hr)| hr).sum::<f32>() / fft_heart_rates.len() as f32;
-        println!("    Average Heart Rate (FFT): {:.1} BPM", avg_fft_hr);
-        println!("    Valid FFT segments: {}", fft_heart_rates.len());
-    }
-
-    if !breathing_rates.is_empty() {
-        let avg_br: f32 =
-            breathing_rates.iter().map(|(_, br)| br).sum::<f32>() / breathing_rates.len() as f32;
-        println!("    Average Breathing Rate: {:.1} breaths/min", avg_br);
-        println!(
-            "    Valid breathing rate segments: {}",
-            breathing_rates.len()
-        );
-    }
-
-    let analysis = PeriodAnalysis {
+    PeriodAnalysis {
         peak_heart_rates,
         fft_heart_rates,
         breathing_rates,
-        side: side.to_string(),
-        period_num,
-    };
-
-    // Print the comparison
-    print_heart_rate_comparison(&analysis);
-
-    analysis
+        side: String::from(sensor_id),
+        period_num: 0,
+    }
 }
 
 fn analyze_bed_presence_periods(
@@ -798,8 +773,80 @@ fn analyze_bed_presence_periods(
         println!("  Found {} raw data points", raw_data.len());
 
         if !raw_data.is_empty() {
+            // Get segment width and overlap from environment variables or use defaults
+            let segment_width: f32 = env::var("SEGMENT_WIDTH_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120.0); // Default: 120 second segments
+
+            let overlap_percent: f32 = env::var("SEGMENT_OVERLAP_PERCENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0); // Default: 0% overlap
+
+            let samples_per_segment = (segment_width * 500.0) as usize;  // 500 Hz sampling rate
+            let overlap_samples = (samples_per_segment as f32 * overlap_percent) as usize;
+            let step_size = samples_per_segment - overlap_samples;
+
+            println!("\n  Processing with:");
+            println!("    Segment width: {} seconds", segment_width);
+            println!("    Overlap: {}%", overlap_percent * 100.0);
+            println!("    Samples per segment: {}", samples_per_segment);
+            println!("    Overlap samples: {}", overlap_samples);
+            println!("    Step size: {} samples", step_size);
+
+            // Extract signals
+            let signal1: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.left1.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                })
+            }).collect();
+
+            let signal2: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.left2.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                })
+            }).collect();
+
             println!("\n  Analyzing left side period...");
-            let analysis = analyze_period_signals(&raw_data, "left", i);
+            let sensor1_results = analyze_single_sensor(
+                &signal1,
+                &raw_data,
+                samples_per_segment,
+                step_size,
+                &format!("left_sensor1_{}", i)
+            );
+
+            let sensor2_results = analyze_single_sensor(
+                &signal2,
+                &raw_data,
+                samples_per_segment,
+                step_size,
+                &format!("left_sensor2_{}", i)
+            );
+
+            // Combine signals by averaging
+            let combined_signal: Vec<i32> = signal1.iter()
+                .zip(signal2.iter())
+                .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+                .collect();
+
+            let combined_results = analyze_single_sensor(
+                &combined_signal,
+                &raw_data,
+                samples_per_segment,
+                step_size,
+                &format!("left_combined_{}", i)
+            );
+
+            println!("\nLeft Sensor 1 Results:");
+            print_detailed_comparison(&sensor1_results, "Left Sensor 1");
+
+            println!("\nLeft Sensor 2 Results:");
+            print_detailed_comparison(&sensor2_results, "Left Sensor 2");
+
+            println!("\nLeft Combined Results:");
+            print_detailed_comparison(&combined_results, "Left Combined");
         } else {
             println!("  No raw data found for this period!");
         }
@@ -823,8 +870,80 @@ fn analyze_bed_presence_periods(
         println!("  Found {} raw data points", raw_data.len());
 
         if !raw_data.is_empty() {
+            // Get segment width and overlap from environment variables or use defaults
+            let segment_width: f32 = env::var("SEGMENT_WIDTH_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120.0); // Default: 120 second segments
+
+            let overlap_percent: f32 = env::var("SEGMENT_OVERLAP_PERCENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0); // Default: 0% overlap
+
+            let samples_per_segment = (segment_width * 500.0) as usize;  // 500 Hz sampling rate
+            let overlap_samples = (samples_per_segment as f32 * overlap_percent) as usize;
+            let step_size = samples_per_segment - overlap_samples;
+
+            println!("\n  Processing with:");
+            println!("    Segment width: {} seconds", segment_width);
+            println!("    Overlap: {}%", overlap_percent * 100.0);
+            println!("    Samples per segment: {}", samples_per_segment);
+            println!("    Overlap samples: {}", overlap_samples);
+            println!("    Step size: {} samples", step_size);
+
+            // Extract signals
+            let signal1: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.right1.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                })
+            }).collect();
+
+            let signal2: Vec<i32> = raw_data.iter().flat_map(|d| {
+                d.right2.chunks_exact(4).map(|chunk| {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                })
+            }).collect();
+
             println!("\n  Analyzing right side period...");
-            let analysis = analyze_period_signals(&raw_data, "right", i);
+            let sensor1_results = analyze_single_sensor(
+                &signal1,
+                &raw_data,
+                samples_per_segment,
+                step_size,
+                &format!("right_sensor1_{}", i)
+            );
+
+            let sensor2_results = analyze_single_sensor(
+                &signal2,
+                &raw_data,
+                samples_per_segment,
+                step_size,
+                &format!("right_sensor2_{}", i)
+            );
+
+            // Combine signals by averaging
+            let combined_signal: Vec<i32> = signal1.iter()
+                .zip(signal2.iter())
+                .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+                .collect();
+
+            let combined_results = analyze_single_sensor(
+                &combined_signal,
+                &raw_data,
+                samples_per_segment,
+                step_size,
+                &format!("right_combined_{}", i)
+            );
+
+            println!("\nRight Sensor 1 Results:");
+            print_detailed_comparison(&sensor1_results, "Right Sensor 1");
+
+            println!("\nRight Sensor 2 Results:");
+            print_detailed_comparison(&sensor2_results, "Right Sensor 2");
+
+            println!("\nRight Combined Results:");
+            print_detailed_comparison(&combined_results, "Right Combined");
         } else {
             println!("  No raw data found for this period!");
         }
@@ -1066,10 +1185,10 @@ fn clean_raw_sensor_data(data: &mut Vec<(u32, SensorData)>) {
             let r2: Vec<i32> = right2.iter().map(|&x| x as i32).collect();
 
             // If any sensor has all values as outliers, remove this data point
-            !heart_analysis::clamp_outliers(&l1, 2).is_empty()
-                && !heart_analysis::clamp_outliers(&l2, 2).is_empty()
-                && !heart_analysis::clamp_outliers(&r1, 2).is_empty()
-                && !heart_analysis::clamp_outliers(&r2, 2).is_empty()
+            !heart_analysis::interpolate_outliers(&l1, 2).is_empty()
+                && !heart_analysis::interpolate_outliers(&l2, 2).is_empty()
+                && !heart_analysis::interpolate_outliers(&r1, 2).is_empty()
+                && !heart_analysis::interpolate_outliers(&r2, 2).is_empty()
         } else {
             true // Keep non-piezo data
         }
@@ -1311,7 +1430,96 @@ fn print_heart_rate_comparison(analysis: &PeriodAnalysis) {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn print_analysis_results(analysis: &PeriodAnalysis, sensor_name: &str) {
+    println!("\nResults for {}:", sensor_name);
+    println!("Peak Detection Method:");
+    println!("  Valid segments: {}", analysis.peak_heart_rates.len());
+    if !analysis.peak_heart_rates.is_empty() {
+        let avg_hr: f32 = analysis.peak_heart_rates.iter().map(|(_, hr)| hr).sum::<f32>()
+            / analysis.peak_heart_rates.len() as f32;
+        println!("  Average heart rate: {:.1} BPM", avg_hr);
+    }
+
+    println!("\nFFT Method:");
+    println!("  Valid segments: {}", analysis.fft_heart_rates.len());
+    if !analysis.fft_heart_rates.is_empty() {
+        let avg_hr: f32 = analysis.fft_heart_rates.iter().map(|(_, hr)| hr).sum::<f32>()
+            / analysis.fft_heart_rates.len() as f32;
+        println!("  Average heart rate: {:.1} BPM", avg_hr);
+    }
+
+    println!("\nBreathing Rate:");
+    println!("  Valid segments: {}", analysis.breathing_rates.len());
+    if !analysis.breathing_rates.is_empty() {
+        let avg_br: f32 = analysis.breathing_rates.iter().map(|(_, br)| br).sum::<f32>()
+            / analysis.breathing_rates.len() as f32;
+        println!("  Average breathing rate: {:.1} breaths/min", avg_br);
+    }
+}
+
+fn print_detailed_comparison(analysis: &PeriodAnalysis, sensor_name: &str) {
+    println!("\nDetailed comparison for {} (5-minute intervals):", sensor_name);
+    println!("Time      Peak HR    FFT HR    Breathing");
+    println!("------------------------------------------");
+
+    let mut current_time = analysis.peak_heart_rates.first()
+        .or(analysis.fft_heart_rates.first())
+        .or(analysis.breathing_rates.first())
+        .map(|(t, _)| *t)
+        .unwrap_or_default();
+
+    let end_time = analysis.peak_heart_rates.last()
+        .or(analysis.fft_heart_rates.last())
+        .or(analysis.breathing_rates.last())
+        .map(|(t, _)| *t)
+        .unwrap_or_default();
+
+    while current_time <= end_time {
+        let interval_end = current_time + chrono::Duration::minutes(5);
+
+        // Calculate averages for this interval
+        let peak_hr = calculate_interval_average(&analysis.peak_heart_rates, current_time, interval_end);
+        let fft_hr = calculate_interval_average(&analysis.fft_heart_rates, current_time, interval_end);
+        let br = calculate_interval_average(&analysis.breathing_rates, current_time, interval_end);
+
+        print!("  {:02}:{:02}     ", current_time.hour(), current_time.minute());
+
+        if let Some(hr) = peak_hr {
+            print!("{:6.1}    ", hr);
+        } else {
+            print!("   --     ");
+        }
+
+        if let Some(hr) = fft_hr {
+            print!("{:6.1}    ", hr);
+        } else {
+            print!("   --     ");
+        }
+
+        if let Some(br) = br {
+            println!("{:6.1}", br);
+        } else {
+            println!("   --");
+        }
+
+        current_time = interval_end;
+    }
+}
+
+fn calculate_interval_average(data: &[(DateTime<Utc>, f32)], start: DateTime<Utc>, end: DateTime<Utc>) -> Option<f32> {
+    let values: Vec<f32> = data.iter()
+        .filter(|(t, _)| *t >= start && *t < end)
+        .map(|(_, v)| *v)
+        .collect();
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f32>() / values.len() as f32)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger
     env_logger::init();
 

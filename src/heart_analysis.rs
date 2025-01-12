@@ -582,7 +582,7 @@ pub fn process(signal: &[f32], sample_rate: f32, window_size: f32) -> (WorkingDa
 }
 
 /// Replace outliers with linear interpolation from neighboring points
-pub fn clamp_outliers(data: &[i32], i: i32) -> Vec<f32> {
+pub fn interpolate_outliers(data: &[i32], i: i32) -> Vec<f32> {
     let data_f32: Vec<f32> = data.iter().map(|&x| x as f32).collect();
 
     // Sort for percentile calculation
