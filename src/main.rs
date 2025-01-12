@@ -94,13 +94,8 @@ struct RawPeriodData {
 
 #[derive(Debug)]
 struct PeriodAnalysis {
-    peak_heart_rates: Vec<(DateTime<Utc>, f32)>, // Results from peak detection
-    fft_heart_rates: Vec<(DateTime<Utc>, f32)>,  // Results from FFT analysis
-    breathing_rates: Vec<(DateTime<Utc>, f32)>,  // Results from breathing analysis
-    signal_amplitude_regularity_scores: Vec<(DateTime<Utc>, f32)>, // Signal stability scores
-    signal_temporal_reality_scores: Vec<(DateTime<Utc>, f32)>, // Breathing pattern regularity scores
-    side: String,
-    period_num: usize,
+    fft_heart_rates: Vec<(DateTime<Utc>, f32)>, // Results from FFT analysis
+    breathing_rates: Vec<(DateTime<Utc>, f32)>, // Results from breathing analysis
 }
 
 fn calculate_stats(data: &[i32]) -> (f32, f32) {
@@ -540,11 +535,8 @@ fn analyse_sensor_data(
     step_size_br: usize,
     sensor_id: &str,
 ) -> PeriodAnalysis {
-    let mut peak_heart_rates = Vec::new();
     let mut fft_heart_rates = Vec::new();
     let mut breathing_rates = Vec::new();
-    let mut signal_amplitude_regularity_scores = Vec::new();
-    let mut signal_temporal_reality_scores = Vec::new();
     let mut prev_fft_hr = None;
 
     // Process segments for heart rate analysis
@@ -573,21 +565,9 @@ fn analyse_sensor_data(
         // Scale the segment
         let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
 
-        // Calculate regularity scores on the cleaned signal after scaling
-        let (cv_score, temporal_regularity) =
-            heart_analysis::calculate_regularity_score(&scaled_segment, 500.0);
-        signal_amplitude_regularity_scores.push((segment_time, cv_score));
-        signal_temporal_reality_scores.push((segment_time, temporal_regularity));
-
-        // Process for heart rate
+        // Process for heart rate using FFT
         let processed_segment =
             heart_analysis::remove_baseline_wander(&scaled_segment, 500.0, 0.05);
-        let (working_data, measures) = heart_analysis::process(&processed_segment, 500.0, 0.75);
-
-        // Store peak detection results if confident
-        if measures.confidence > 0.5 {
-            peak_heart_rates.push((segment_time, measures.bpm));
-        }
 
         // Store FFT results, passing previous heart rate
         if let Some(fft_hr) =
@@ -632,13 +612,8 @@ fn analyse_sensor_data(
     }
 
     PeriodAnalysis {
-        peak_heart_rates,
         fft_heart_rates,
         breathing_rates,
-        side: String::from(sensor_id),
-        period_num: 0,
-        signal_amplitude_regularity_scores,
-        signal_temporal_reality_scores,
     }
 }
 
@@ -771,15 +746,6 @@ fn analyze_bed_presence_periods(
                 &format!("left_combined_{}", i),
             );
 
-            println!("\nLeft Sensor 1 Results:");
-            print_detailed_comparison(&analysis1, "Left Sensor 1");
-
-            println!("\nLeft Sensor 2 Results:");
-            print_detailed_comparison(&analysis2, "Left Sensor 2");
-
-            println!("\nLeft Combined Results:");
-            print_detailed_comparison(&analysis_combined, "Left Combined");
-
             if let Ok(base_path) = env::var("CSV_OUTPUT") {
                 for (i, period) in left_periods.iter().enumerate() {
                     // Write left side results
@@ -867,15 +833,6 @@ fn analyze_bed_presence_periods(
                     &format!("right_combined_{}", i),
                 );
 
-                println!("\nRight Sensor 1 Results:");
-                print_detailed_comparison(&analysis1, "Right Sensor 1");
-
-                println!("\nRight Sensor 2 Results:");
-                print_detailed_comparison(&analysis2, "Right Sensor 2");
-
-                println!("\nRight Combined Results:");
-                print_detailed_comparison(&analysis_combined, "Right Combined");
-
                 if let Ok(base_path) = env::var("CSV_OUTPUT") {
                     for (i, period) in right_periods.iter().enumerate() {
                         // Write right side results
@@ -916,45 +873,20 @@ fn write_analysis_to_csv(
 
     // Collect all timestamps
     let mut timestamps: Vec<DateTime<Utc>> = Vec::new();
-    timestamps.extend(analysis.peak_heart_rates.iter().map(|(t, _)| *t));
     timestamps.extend(analysis.fft_heart_rates.iter().map(|(t, _)| *t));
     timestamps.extend(analysis.breathing_rates.iter().map(|(t, _)| *t));
     timestamps.sort_unstable();
     timestamps.dedup();
 
     // Interpolate and smooth heart rates
-    let smoothed_peak_hr =
-        heart_analysis::interpolate_and_smooth(&timestamps, &analysis.peak_heart_rates, 60);
     let smoothed_fft_hr =
         heart_analysis::interpolate_and_smooth(&timestamps, &analysis.fft_heart_rates, 60);
 
     // Write header
-    writer.write_record(&[
-        "timestamp",
-        "peak_hr",
-        "peak_hr_smoothed",
-        "fft_hr",
-        "fft_hr_smoothed",
-        "breathing_rate",
-        "amplitude_regularity",
-        "temporal_regularity",
-    ])?;
+    writer.write_record(&["timestamp", "fft_hr", "fft_hr_smoothed", "breathing_rate"])?;
 
     // Write data for each timestamp
     for &timestamp in &timestamps {
-        let peak_hr = analysis
-            .peak_heart_rates
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, hr)| hr.to_string())
-            .unwrap_or_default();
-
-        let peak_hr_smoothed = smoothed_peak_hr
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, hr)| hr.to_string())
-            .unwrap_or_default();
-
         let fft_hr = analysis
             .fft_heart_rates
             .iter()
@@ -975,136 +907,16 @@ fn write_analysis_to_csv(
             .map(|(_, br)| br.to_string())
             .unwrap_or_default();
 
-        let amp_reg = analysis
-            .signal_amplitude_regularity_scores
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, score)| score.to_string())
-            .unwrap_or_default();
-
-        let temp_reg = analysis
-            .signal_temporal_reality_scores
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, score)| score.to_string())
-            .unwrap_or_default();
-
         writer.write_record(&[
             timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-            peak_hr,
-            peak_hr_smoothed,
             fft_hr,
             fft_hr_smoothed,
             br,
-            amp_reg,
-            temp_reg,
         ])?;
     }
 
     writer.flush()?;
     Ok(())
-}
-
-fn print_detailed_comparison(analysis: &PeriodAnalysis, sensor_name: &str) {
-    println!(
-        "\nDetailed comparison for {} (5-minute intervals):",
-        sensor_name
-    );
-    println!("Time      Peak HR    FFT HR    Breathing    CV Score    Signal Regularity");
-    println!("-------------------------------------------------------------------------");
-
-    let mut current_time = analysis
-        .peak_heart_rates
-        .first()
-        .or(analysis.fft_heart_rates.first())
-        .or(analysis.breathing_rates.first())
-        .map(|(t, _)| *t)
-        .unwrap_or_default();
-
-    let end_time = analysis
-        .peak_heart_rates
-        .last()
-        .or(analysis.fft_heart_rates.last())
-        .or(analysis.breathing_rates.last())
-        .map(|(t, _)| *t)
-        .unwrap_or_default();
-
-    while current_time <= end_time {
-        let interval_end = current_time + chrono::Duration::minutes(5);
-
-        // Calculate averages for this interval
-        let peak_hr =
-            calculate_interval_average(&analysis.peak_heart_rates, current_time, interval_end);
-        let fft_hr =
-            calculate_interval_average(&analysis.fft_heart_rates, current_time, interval_end);
-        let br = calculate_interval_average(&analysis.breathing_rates, current_time, interval_end);
-        let cv = calculate_interval_average(
-            &analysis.signal_amplitude_regularity_scores,
-            current_time,
-            interval_end,
-        );
-        let regularity = calculate_interval_average(
-            &analysis.signal_temporal_reality_scores,
-            current_time,
-            interval_end,
-        );
-
-        print!(
-            "  {:02}:{:02}     ",
-            current_time.hour(),
-            current_time.minute()
-        );
-
-        if let Some(hr) = peak_hr {
-            print!("{:6.1}    ", hr);
-        } else {
-            print!("   --     ");
-        }
-
-        if let Some(hr) = fft_hr {
-            print!("{:6.1}    ", hr);
-        } else {
-            print!("   --     ");
-        }
-
-        if let Some(br) = br {
-            print!("{:6.1}", br);
-        } else {
-            print!("   --");
-        }
-
-        if let Some(cv) = cv {
-            print!("{:6.1}", cv);
-        } else {
-            print!("   --");
-        }
-
-        if let Some(regularity) = regularity {
-            println!("{:6.1}", regularity);
-        } else {
-            println!("   --");
-        }
-
-        current_time = interval_end;
-    }
-}
-
-fn calculate_interval_average(
-    data: &[(DateTime<Utc>, f32)],
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Option<f32> {
-    let values: Vec<f32> = data
-        .iter()
-        .filter(|(t, _)| *t >= start && *t < end)
-        .map(|(_, v)| *v)
-        .collect();
-
-    if values.is_empty() {
-        None
-    } else {
-        Some(values.iter().sum::<f32>() / values.len() as f32)
-    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1152,6 +964,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Then remove stat outliers
     let len_before = all_processed_data.len();
     remove_stat_outliers(&mut all_processed_data);
+
     println!(
         "Removed {} rows as mean/std outliers",
         len_before - all_processed_data.len()
