@@ -665,12 +665,12 @@ fn analyze_bed_presence_periods(
     let segment_width_hr: f32 = env::var("HR_WINDOW_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(120.0); // Default: 120 second segments
+        .unwrap_or(10.0); // Default: 10 second segments
 
     let overlap_percent_hr: f32 = env::var("HR_WINDOW_OVERLAP_PERCENT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0); // Default: 0% overlap
+        .unwrap_or(0.1); // Default: 10% overlap
 
     // Get segment width and overlap from environment variables or use defaults
     let segment_width_br: f32 = env::var("BR_WINDOW_SECONDS")
