@@ -594,7 +594,7 @@ fn analyse_sensor_data(
         // Scale the segment
         let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
 
-        // Process for heart rate using FFT
+        // Notch filter to remove baseline wander
         let processed_segment =
             heart_analysis::remove_baseline_wander(&scaled_segment, 500.0, 0.05);
 
@@ -665,7 +665,7 @@ fn analyze_bed_presence_periods(
     let segment_width_hr: f32 = env::var("HR_WINDOW_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10.0); // Default: 10 second segments
+        .unwrap_or(10.0); // Default: 60 second segments
 
     let overlap_percent_hr: f32 = env::var("HR_WINDOW_OVERLAP_PERCENT")
         .ok()
@@ -676,7 +676,7 @@ fn analyze_bed_presence_periods(
     let segment_width_br: f32 = env::var("BR_WINDOW_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(120.0); // Default: 120 second segments
+        .unwrap_or(120.0); // Default: 60 second segments
 
     let overlap_percent_br: f32 = env::var("BR_WINDOW_OVERLAP_PERCENT")
         .ok()

@@ -72,7 +72,7 @@ pub fn remove_baseline_wander(data: &[f32], sample_rate: f32, cutoff: f32) -> Ve
     // Convert to sci-rs's Sos format
     let sos_array = vec![Sos::new(
         [sos[0][0], sos[0][1], sos[0][2]],
-        [1.0, sos[0][4], sos[0][5]],
+        [sos[0][3], sos[0][4], sos[0][5]],
     )];
 
     sosfiltfilt_dyn(data.iter(), &sos_array)
@@ -181,9 +181,9 @@ pub fn analyze_heart_rate_fft(
     // Calculate frequency resolution
     let freq_resolution = sample_rate / signal.len() as f32;
 
-    // Look at magnitude spectrum in the heart rate range (45-80 BPM = 0.75-1.33 Hz)
+    // Look at magnitude spectrum in the heart rate range (45-100 BPM = 0.75-1.67 Hz)
     let min_bin = (0.75 / freq_resolution) as usize;
-    let max_bin = (1.33 / freq_resolution) as usize;
+    let max_bin = (1.67 / freq_resolution) as usize;
 
     // Find all peaks in the heart rate range
     let mut peaks = Vec::new();
