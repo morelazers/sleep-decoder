@@ -572,6 +572,9 @@ fn analyse_sensor_data(
     let mut breathing_rates = Vec::new();
     let mut prev_fft_hr = None;
 
+    // Create heart rate history tracker with 15-minute window
+    let mut hr_history = heart_analysis::HeartRateHistory::new(15.0 * 60.0); // 15 minutes in seconds
+
     // Process segments for heart rate analysis
     let total_samples = signal.len();
     let num_segments_hr = (total_samples - samples_per_segment_hr) / step_size_hr + 1;
@@ -585,27 +588,29 @@ fn analyse_sensor_data(
             continue;
         }
 
-        // Extract segment
+        // Extract segment and get timestamp
         let segment = &signal[start_sample..end_sample];
         let segment_time = raw_data[start_sample / 500].timestamp;
 
-        // Remove outliers from the segment
+        // Process segment as before...
         let cleaned_segment = heart_analysis::interpolate_outliers(segment, 2);
-
-        // Convert to f32 for processing
         let segment_f32: Vec<f32> = cleaned_segment.iter().map(|&x| x as f32).collect();
-
-        // Scale the segment
         let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
-
-        // Notch filter to remove baseline wander
         let processed_segment =
             heart_analysis::remove_baseline_wander(&scaled_segment, 500.0, 0.05);
 
-        // Store FFT results, passing previous heart rate
-        if let Some(fft_hr) =
-            heart_analysis::analyze_heart_rate_fft(&processed_segment, 500.0, prev_fft_hr)
-        {
+        // Calculate time step
+        let time_step = samples_per_segment_hr as f32 / 500.0;
+
+        // Analyze heart rate with history tracking
+        if let Some(fft_hr) = heart_analysis::analyze_heart_rate_fft(
+            &processed_segment,
+            500.0,
+            prev_fft_hr,
+            segment_time,
+            &mut hr_history,
+            time_step,
+        ) {
             fft_heart_rates.push((segment_time, fft_hr));
             prev_fft_hr = Some(fft_hr);
         }

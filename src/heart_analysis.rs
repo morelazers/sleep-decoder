@@ -151,12 +151,152 @@ fn tf2sos(b: &[f32], a: &[f32]) -> Vec<[f32; 6]> {
     vec![[b[0], b[1], b[2], 1.0, a[1] / a[0], a[2] / a[0]]]
 }
 
-/// Analyze heart rate using FFT, considering previous heart rate for continuity
+/// Calculate physiologically possible heart rate range based on previous HR
+fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
+    // Reduce maximum allowed changes
+    const MAX_INSTANT_CHANGE: f32 = 6.0;
+    const MAX_GRADUAL_CHANGE: f32 = 1.5;
+
+    // Calculate maximum possible change for this time step
+    let max_change = if time_step <= 5.0 {
+        MAX_INSTANT_CHANGE * time_step
+    } else {
+        (MAX_INSTANT_CHANGE * 5.0) + (MAX_GRADUAL_CHANGE * (time_step - 5.0))
+    };
+
+    // Make the range slightly asymmetric - less aggressive downward bias
+    let upward_change = max_change * 0.85; // Changed from 0.7 - allow more upward movement
+    let downward_change = max_change * 0.9; // Add small restriction to downward movement too
+
+    // Calculate range with smaller buffer
+    let min_hr = (prev_hr - downward_change - 3.0).max(35.0);
+    let max_hr = (prev_hr + upward_change + 3.0).min(95.0);
+
+    // Less aggressive HR zone restrictions
+    let max_hr = if prev_hr < 60.0 {
+        // Low HR zone - allow more upward movement
+        (prev_hr + upward_change * 0.8).min(80.0) // Changed from 0.6 and 75.0
+    } else if prev_hr < 75.0 {
+        // Medium HR zone
+        (prev_hr + upward_change * 0.9).min(90.0) // Changed from 0.8 and 85.0
+    } else {
+        // High HR zone
+        max_hr
+    };
+
+    (min_hr, max_hr)
+}
+
+/// Calculate signal quality metric
+fn calculate_signal_quality(signal: &[f32]) -> f32 {
+    // Calculate signal variance
+    let mean = signal.iter().sum::<f32>() / signal.len() as f32;
+    let variance = signal.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / signal.len() as f32;
+
+    // Calculate zero crossings
+    let zero_crossings = signal
+        .windows(2)
+        .filter(|w| w[0].signum() != w[1].signum())
+        .count();
+
+    // Combine metrics (lower score = noisier signal)
+    let quality_score = 1.0 / (1.0 + variance * (zero_crossings as f32 / signal.len() as f32));
+
+    quality_score
+}
+
+/// Detect if a heart rate change is suspicious based on multiple criteria
+fn is_suspicious_change(
+    bpm: f32,
+    magnitude: f32,
+    max_magnitude: f32,
+    prev_hr: f32,
+    quality: f32,
+) -> bool {
+    let hr_change = (bpm - prev_hr).abs();
+    let normalized_magnitude = magnitude / max_magnitude;
+
+    // Criteria for suspicious changes:
+    // 1. Large change with weak peak
+    // 2. Change size relative to signal quality
+    // 3. Magnitude threshold increases with larger changes
+
+    let required_magnitude = 0.3 + (hr_change / 20.0).min(0.3); // Higher threshold for bigger changes
+
+    (hr_change > 8.0 && normalized_magnitude < required_magnitude)
+        || (hr_change > 12.0 && quality < 0.4)
+        || (hr_change > 15.0 && normalized_magnitude < 0.6)
+}
+
+/// Store historical heart rate data
+pub struct HeartRateHistory {
+    rates: Vec<(DateTime<Utc>, f32)>, // (timestamp, heart_rate)
+    window_duration: f32,             // Duration to look back in seconds
+}
+
+impl HeartRateHistory {
+    pub fn new(window_duration: f32) -> Self {
+        Self {
+            rates: Vec::new(),
+            window_duration,
+        }
+    }
+
+    pub fn add_measurement(&mut self, timestamp: DateTime<Utc>, rate: f32) {
+        self.rates.push((timestamp, rate));
+
+        // Remove old measurements
+        let cutoff = timestamp - chrono::Duration::seconds(self.window_duration as i64);
+        self.rates.retain(|(ts, _)| *ts >= cutoff);
+    }
+
+    pub fn get_trend(&self) -> Option<f32> {
+        if self.rates.len() < 2 {
+            return None;
+        }
+
+        // Calculate rate of change in BPM per minute
+        let (first_ts, first_rate) = self.rates.first()?;
+        let (last_ts, last_rate) = self.rates.last()?;
+
+        let duration_mins = (*last_ts - first_ts).num_seconds() as f32 / 60.0;
+        if duration_mins < 1.0 {
+            return None;
+        }
+
+        Some((last_rate - first_rate) / duration_mins)
+    }
+}
+
+/// Modify the heart rate analysis function to use history
 pub fn analyze_heart_rate_fft(
     signal: &[f32],
     sample_rate: f32,
     prev_hr: Option<f32>,
+    timestamp: DateTime<Utc>,
+    history: &mut HeartRateHistory,
+    time_step: f32,
 ) -> Option<f32> {
+    let quality = calculate_signal_quality(signal);
+
+    // Check both trend and physiological plausibility
+    if let Some(prev_hr) = prev_hr {
+        // Check overall trend
+        if let Some(trend) = history.get_trend() {
+            if !validate_rate_of_change(trend, trend < 0.0) {
+                debug!("Trend too steep ({:.2} BPM/min), being conservative", trend);
+                let smoothed_bpm = prev_hr;
+                history.add_measurement(timestamp, smoothed_bpm);
+                return Some(smoothed_bpm);
+            }
+        }
+    }
+
+    // If signal is too noisy and we have a previous value, return previous
+    if quality < 0.35 && prev_hr.is_some() {
+        return prev_hr;
+    }
+
     // Apply Hann window
     let window = create_hann_window(signal.len());
     let windowed_signal: Vec<f32> = signal
@@ -178,12 +318,21 @@ pub fn analyze_heart_rate_fft(
     // Perform FFT
     fft.process(&mut buffer);
 
-    // Calculate frequency resolution
-    let freq_resolution = sample_rate / signal.len() as f32;
+    // Calculate frequency range
+    let (min_hr, max_hr) = if let Some(prev_hr) = prev_hr {
+        get_adaptive_hr_range(prev_hr, time_step)
+    } else {
+        (40.0, 100.0) // Default range if no previous HR
+    };
 
-    // Look at magnitude spectrum in the heart rate range (40-100 BPM = 0.67-1.67 Hz)
-    let min_bin = (0.67 / freq_resolution) as usize;
-    let max_bin = (1.67 / freq_resolution) as usize;
+    // Convert BPM to Hz
+    let min_freq = min_hr / 60.0;
+    let max_freq = max_hr / 60.0;
+
+    // Calculate bin range for FFT
+    let freq_resolution = sample_rate / signal.len() as f32;
+    let min_bin = (min_freq / freq_resolution) as usize;
+    let max_bin = (max_freq / freq_resolution) as usize;
 
     // Find all peaks in the heart rate range
     let mut peaks = Vec::new();
@@ -205,40 +354,83 @@ pub fn analyze_heart_rate_fft(
 
     // If we have a previous heart rate, try to find a peak close to it
     if let Some(prev_hr) = prev_hr {
-        // Look at top 3 peaks (if available) and choose the one closest to previous HR
         let top_peaks: Vec<(f32, f32)> = peaks
             .iter()
-            .take(3)
-            .filter(|(_bpm, magnitude)| {
-                // Must be at least 20% of strongest peak's magnitude
-                *magnitude >= peaks[0].1 * 0.2
-            })
+            .take(7)
+            .filter(|(_bpm, magnitude)| *magnitude >= peaks[0].1 * 0.2)
             .cloned()
             .collect();
 
         if !top_peaks.is_empty() {
-            // Find the peak closest to previous heart rate
-            let closest_peak = top_peaks.iter().min_by(|(bpm1, _), (bpm2, _)| {
-                let diff1 = (bpm1 - prev_hr).abs();
-                let diff2 = (bpm2 - prev_hr).abs();
-                diff1.partial_cmp(&diff2).unwrap()
-            });
+            let best_peak = top_peaks
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
 
-            if let Some(&(bpm, _)) = closest_peak {
-                // Only accept if it's not too far from previous HR (max 15 BPM difference)
-                if (bpm - prev_hr).abs() <= 15.0 {
-                    return Some(bpm);
-                }
+            let (bpm, magnitude) = *best_peak;
+
+            // After finding best peak but before applying it:
+            // Check if the change is physiologically plausible
+            let window_duration = if let Some((first_ts, _)) = history.rates.first() {
+                (timestamp - *first_ts).num_seconds() as f32
+            } else {
+                time_step
+            };
+
+            if !is_physiologically_plausible(bpm, prev_hr, window_duration) {
+                debug!(
+                    "Change not physiologically plausible: {:.1} -> {:.1} BPM",
+                    prev_hr, bpm
+                );
+                let smoothed_bpm = prev_hr;
+                history.add_measurement(timestamp, smoothed_bpm);
+                return Some(smoothed_bpm);
             }
+
+            // Check if this change is suspicious
+            if is_suspicious_change(bpm, magnitude, peaks[0].1, prev_hr, quality) {
+                let maintained_hr = prev_hr;
+                history.add_measurement(timestamp, maintained_hr);
+                return Some(maintained_hr);
+            }
+
+            // Calculate and apply confidence-based weighting
+            let confidence = {
+                let normalized_magnitude = magnitude / peaks[0].1;
+                let hr_change = (bpm - prev_hr).abs();
+                let change_penalty = (hr_change / 20.0).min(0.5);
+                let base_confidence = normalized_magnitude * quality;
+                (base_confidence - change_penalty).max(0.0)
+            };
+
+            let smoothed_bpm = if confidence >= 0.8 {
+                let weight = 0.8;
+                bpm * weight + prev_hr * (1.0 - weight)
+            } else if confidence >= 0.6 {
+                let weight = confidence / 2.5;
+                bpm * weight + prev_hr * (1.0 - weight)
+            } else {
+                let weight = 0.05;
+                bpm * weight + prev_hr * (1.0 - weight)
+            };
+
+            history.add_measurement(timestamp, smoothed_bpm);
+            return Some(smoothed_bpm);
         }
     }
 
     // If no previous HR or no suitable peaks found near previous HR,
     // return the strongest peak if it's in valid range
-    peaks
+    let result = peaks
         .first()
         .map(|&(bpm, _)| bpm)
-        .filter(|&bpm| bpm >= 40.0 && bpm <= 180.0)
+        .filter(|&bpm| bpm >= 40.0 && bpm <= 100.0);
+
+    if let Some(bpm) = result {
+        history.add_measurement(timestamp, bpm);
+    }
+
+    result
 }
 
 /// Analyze breathing rate using FFT on the scaled signal
@@ -382,4 +574,24 @@ pub fn interpolate_and_smooth(
     }
 
     smoothed
+}
+
+/// At module level
+const MAX_DECREASE_RATE: f32 = 1.2; // BPM per minute
+const MAX_INCREASE_RATE: f32 = 1.5; // BPM per minute
+
+/// Validate rate of change against physiological limits
+fn validate_rate_of_change(rate_of_change: f32, is_decrease: bool) -> bool {
+    if is_decrease {
+        rate_of_change >= -MAX_DECREASE_RATE
+    } else {
+        rate_of_change <= MAX_INCREASE_RATE
+    }
+}
+
+/// Check if heart rate change is physiologically plausible
+fn is_physiologically_plausible(current_bpm: f32, prev_hr: f32, window_duration: f32) -> bool {
+    let hr_change = current_bpm - prev_hr;
+    let rate_of_change = hr_change / (window_duration / 60.0); // Convert to per minute
+    validate_rate_of_change(rate_of_change, hr_change < 0.0)
 }
