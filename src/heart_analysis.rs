@@ -12,7 +12,7 @@ fn create_hann_window(size: usize) -> Vec<f32> {
 }
 
 /// Design notch or peak digital filter.
-fn design_notch_peak_filter(mut w0: f32, Q: f32, ftype: &str, fs: f32) -> (Vec<f32>, Vec<f32>) {
+fn design_notch_peak_filter(mut w0: f32, q: f32, ftype: &str, fs: f32) -> (Vec<f32>, Vec<f32>) {
     // Validate fs
     assert!(fs > 0.0, "fs must be positive");
 
@@ -23,7 +23,7 @@ fn design_notch_peak_filter(mut w0: f32, Q: f32, ftype: &str, fs: f32) -> (Vec<f
     assert!(w0 > 0.0 && w0 < 1.0, "w0 should be such that 0 < w0 < 1");
 
     // Get bandwidth
-    let mut bw = w0 / Q;
+    let mut bw = w0 / q;
 
     // Normalize inputs
     bw = bw * PI;
@@ -209,7 +209,7 @@ pub fn analyze_heart_rate_fft(
         let top_peaks: Vec<(f32, f32)> = peaks
             .iter()
             .take(3)
-            .filter(|(bpm, magnitude)| {
+            .filter(|(_bpm, magnitude)| {
                 // Must be at least 20% of strongest peak's magnitude
                 *magnitude >= peaks[0].1 * 0.2
             })
@@ -310,77 +310,6 @@ pub fn analyze_breathing_rate_fft(signal: &[f32], sample_rate: f32) -> Option<f3
         );
         None
     }
-}
-
-/// Calculate regularity scores for a signal segment.
-/// Returns a tuple of (amplitude_regularity, temporal_regularity)
-/// Both scores are in range 0-1, where higher values indicate more regular signals
-pub fn calculate_regularity_score(signal: &[f32], sample_rate: f32) -> (f32, f32) {
-    // Apply Hann window to reduce spectral leakage
-    let window = create_hann_window(signal.len());
-    let windowed_signal: Vec<f32> = signal
-        .iter()
-        .zip(window.iter())
-        .map(|(&s, &w)| s * w)
-        .collect();
-
-    // Prepare FFT
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(signal.len());
-    let mut buffer: Vec<Complex<f32>> = windowed_signal
-        .iter()
-        .map(|&x| Complex::new(x, 0.0))
-        .collect();
-
-    // Perform FFT
-    fft.process(&mut buffer);
-
-    // Calculate power spectrum
-    let mut power_spectrum: Vec<f32> = buffer.iter().map(|x| x.norm_sqr() as f32).collect();
-
-    // Only look at first half (due to symmetry)
-    power_spectrum.truncate(signal.len() / 2);
-
-    // Calculate total power
-    let total_power: f32 = power_spectrum.iter().sum();
-
-    // Skip if total power is too low (likely a flat signal)
-    if total_power < 1e-6 {
-        return (0.0, 0.0);
-    }
-
-    // Sort power spectrum for percentile calculations
-    let mut sorted_power = power_spectrum.clone();
-    sorted_power.sort_by(|a, b| b.partial_cmp(a).unwrap()); // Sort in descending order
-
-    // Calculate power ratio: top 3 peaks vs total power
-    let power_in_top_peaks: f32 = sorted_power.iter().take(3).sum();
-    let power_ratio = power_in_top_peaks / total_power;
-
-    // More discriminating spectral concentration score
-    // Score of 1.0 means top 3 peaks contain 50% of total power
-    // Score of 0.0 means top 3 peaks contain 5% or less of total power
-    let spectral_concentration = ((power_ratio - 0.05) / 0.45).clamp(0.0, 1.0);
-
-    // Calculate normalized power distribution
-    let normalized_power: Vec<f32> = power_spectrum.iter().map(|&p| p / total_power).collect();
-
-    // Calculate spectral flatness (geometric mean / arithmetic mean)
-    let geometric_mean: f32 = normalized_power
-        .iter()
-        .filter(|&&p| p > 1e-10) // Avoid log(0)
-        .map(|&p| p.ln())
-        .sum::<f32>()
-        .exp();
-    let arithmetic_mean: f32 = normalized_power.iter().sum::<f32>() / normalized_power.len() as f32;
-
-    // Spectral flatness will be close to 1 for white noise and close to 0 for pure tones
-    let flatness = geometric_mean / arithmetic_mean;
-
-    // Convert flatness to regularity score (invert and scale)
-    let regularity = (1.0 - flatness).powf(0.5); // Square root to make it more sensitive
-
-    (spectral_concentration, regularity)
 }
 
 /// Interpolate missing values and smooth the time series

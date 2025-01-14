@@ -1,9 +1,9 @@
 use anyhow::Context;
-use chrono::Timelike;
+use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use env_logger;
-use log::{debug, trace};
+use log::trace;
 use serde::{Deserialize, Serialize};
 use serde_bytes;
 use std::env;
@@ -18,6 +18,22 @@ struct Args {
     /// Directory containing .RAW files
     #[arg(help = "Directory containing .RAW files")]
     raw_dir: PathBuf,
+
+    /// Start time (format: YYYY-MM-DD HH:MM), defaults to 24 hours ago
+    #[arg(long, env = "ANALYSIS_START_TIME")]
+    start_time: Option<String>,
+
+    /// End time (format: YYYY-MM-DD HH:MM), defaults to now
+    #[arg(long, env = "ANALYSIS_END_TIME")]
+    end_time: Option<String>,
+
+    /// CSV output file prefix (e.g. /path/to/output/prefix)
+    #[arg(long, env = "CSV_OUTPUT")]
+    csv_output: Option<String>,
+
+    /// Split sensors into separate CSV files
+    #[arg(long, env = "SPLIT_SENSORS")]
+    split_sensors: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,11 +44,11 @@ struct BatchItem {
 
 #[derive(Debug, Deserialize)]
 struct BedTempSide {
-    side: f32,
-    out: f32,
-    cen: f32,
+    _side: f32,
+    _out: f32,
+    _cen: f32,
     #[serde(rename = "in")]
-    in_: f32,
+    _in: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,11 +71,11 @@ enum SensorData {
     },
     #[serde(rename = "bedTemp")]
     BedTemp {
-        ts: i64,
-        mcu: f32,
-        amb: f32,
-        left: BedTempSide,
-        right: BedTempSide,
+        _ts: i64,
+        _mcu: f32,
+        _amb: f32,
+        _left: BedTempSide,
+        _right: BedTempSide,
     },
 }
 
@@ -96,6 +112,20 @@ struct RawPeriodData {
 struct PeriodAnalysis {
     fft_heart_rates: Vec<(DateTime<Utc>, f32)>, // Results from FFT analysis
     breathing_rates: Vec<(DateTime<Utc>, f32)>, // Results from breathing analysis
+}
+
+#[derive(Debug)]
+struct SideAnalysis {
+    sensor1: PeriodAnalysis,
+    sensor2: PeriodAnalysis,
+    combined: PeriodAnalysis,
+    period_num: usize,
+}
+
+#[derive(Debug)]
+struct BedAnalysis {
+    left_side: Vec<SideAnalysis>,
+    right_side: Vec<SideAnalysis>,
 }
 
 fn calculate_stats(data: &[i32]) -> (f32, f32) {
@@ -533,7 +563,6 @@ fn analyse_sensor_data(
     step_size_hr: usize,
     samples_per_segment_br: usize,
     step_size_br: usize,
-    sensor_id: &str,
 ) -> PeriodAnalysis {
     let mut fft_heart_rates = Vec::new();
     let mut breathing_rates = Vec::new();
@@ -620,7 +649,12 @@ fn analyse_sensor_data(
 fn analyze_bed_presence_periods(
     raw_sensor_data: &[(u32, SensorData)],
     all_processed_data: &[ProcessedData],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BedAnalysis> {
+    let mut bed_analysis = BedAnalysis {
+        left_side: Vec::new(),
+        right_side: Vec::new(),
+    };
+
     // Detect presence for both sides
     let left_periods = detect_bed_presence(all_processed_data, "left");
     let right_periods = detect_bed_presence(all_processed_data, "right");
@@ -716,7 +750,6 @@ fn analyze_bed_presence_periods(
                 step_size_hr,
                 samples_per_segment_br,
                 step_size_br,
-                &format!("left_sensor1_{}", i),
             );
 
             let analysis2 = analyse_sensor_data(
@@ -726,7 +759,6 @@ fn analyze_bed_presence_periods(
                 step_size_hr,
                 samples_per_segment_br,
                 step_size_br,
-                &format!("left_sensor2_{}", i),
             );
 
             // Combine signals by averaging
@@ -743,17 +775,14 @@ fn analyze_bed_presence_periods(
                 step_size_hr,
                 samples_per_segment_br,
                 step_size_br,
-                &format!("left_combined_{}", i),
             );
 
-            if let Ok(base_path) = env::var("CSV_OUTPUT") {
-                for (i, period) in left_periods.iter().enumerate() {
-                    // Write left side results
-                    write_analysis_to_csv(&base_path, "left", i, &analysis1)?;
-                    write_analysis_to_csv(&base_path, "left2", i, &analysis2)?;
-                    write_analysis_to_csv(&base_path, "left_combined", i, &analysis_combined)?;
-                }
-            }
+            bed_analysis.left_side.push(SideAnalysis {
+                sensor1: analysis1,
+                sensor2: analysis2,
+                combined: analysis_combined,
+                period_num: i,
+            });
         } else {
             println!("  No raw data found for this period!");
         }
@@ -803,7 +832,6 @@ fn analyze_bed_presence_periods(
                     step_size_hr,
                     samples_per_segment_br,
                     step_size_br,
-                    &format!("right_sensor1_{}", i),
                 );
 
                 let analysis2 = analyse_sensor_data(
@@ -813,7 +841,6 @@ fn analyze_bed_presence_periods(
                     step_size_hr,
                     samples_per_segment_br,
                     step_size_br,
-                    &format!("right_sensor2_{}", i),
                 );
 
                 // Combine signals by averaging
@@ -830,24 +857,21 @@ fn analyze_bed_presence_periods(
                     step_size_hr,
                     samples_per_segment_br,
                     step_size_br,
-                    &format!("right_combined_{}", i),
                 );
 
-                if let Ok(base_path) = env::var("CSV_OUTPUT") {
-                    for (i, period) in right_periods.iter().enumerate() {
-                        // Write right side results
-                        write_analysis_to_csv(&base_path, "right", i, &analysis1)?;
-                        write_analysis_to_csv(&base_path, "right2", i, &analysis2)?;
-                        write_analysis_to_csv(&base_path, "right_combined", i, &analysis_combined)?;
-                    }
-                }
+                bed_analysis.right_side.push(SideAnalysis {
+                    sensor1: analysis1,
+                    sensor2: analysis2,
+                    combined: analysis_combined,
+                    period_num: i,
+                });
             } else {
                 println!("  No raw data found for this period!");
             }
         }
     }
 
-    Ok(())
+    Ok(bed_analysis)
 }
 
 fn write_analysis_to_csv(
@@ -908,7 +932,7 @@ fn write_analysis_to_csv(
             .unwrap_or_default();
 
         writer.write_record(&[
-            timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+            timestamp.format("%Y-%m-%d %H:%M").to_string(),
             fft_hr,
             fft_hr_smoothed,
             br,
@@ -917,6 +941,11 @@ fn write_analysis_to_csv(
 
     writer.flush()?;
     Ok(())
+}
+
+fn parse_datetime(datetime_str: &str) -> anyhow::Result<DateTime<Utc>> {
+    let naive = NaiveDateTime::parse_from_str(datetime_str, "%Y-%m-%d %H:%M")?;
+    Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -945,6 +974,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (*seq, 0)
         }
     });
+
+    println!("Loaded {} raw sensor data points", raw_sensor_data.len());
+
+    if raw_sensor_data.is_empty() {
+        println!("No raw sensor data found");
+        return Ok(());
+    }
+
+    // Only filter by timeframe if start/end times were provided
+    if args.start_time.is_some() || args.end_time.is_some() {
+        let end_time = match args.end_time {
+            Some(ref t) => parse_datetime(t)?,
+            None => Utc::now(),
+        };
+
+        let start_time = match args.start_time {
+            Some(ref t) => parse_datetime(t)?,
+            None => end_time - chrono::Duration::days(1),
+        };
+
+        println!("Analyzing data from {} to {}", start_time, end_time);
+
+        // Filter data by timestamp after sorting
+        let initial_count = raw_sensor_data.len();
+        raw_sensor_data.retain(|(_seq, data)| {
+            if let SensorData::PiezoDual { ts, .. } = data {
+                let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
+                timestamp >= start_time && timestamp <= end_time
+            } else {
+                false
+            }
+        });
+
+        println!(
+            "Filtered {} data points to {} within specified timeframe",
+            initial_count,
+            raw_sensor_data.len()
+        );
+    }
 
     // Process all sensor data at once
     let mut all_processed_data: Vec<ProcessedData> = raw_sensor_data
@@ -976,7 +1044,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scale_data(&mut all_processed_data);
 
     // Analyze the raw data during bed presence periods
-    analyze_bed_presence_periods(&raw_sensor_data, &all_processed_data)?;
+    let bed_analysis = analyze_bed_presence_periods(&raw_sensor_data, &all_processed_data)?;
+
+    // Write CSV files if output prefix was provided
+    if let Some(prefix) = &args.csv_output {
+        for analysis in &bed_analysis.left_side {
+            if let Some(split_sensors) = &args.split_sensors {
+                if *split_sensors == true {
+                    write_analysis_to_csv(prefix, "left", analysis.period_num, &analysis.sensor1)?;
+                    write_analysis_to_csv(prefix, "left2", analysis.period_num, &analysis.sensor2)?;
+                }
+            }
+            write_analysis_to_csv(
+                prefix,
+                "left_combined",
+                analysis.period_num,
+                &analysis.combined,
+            )?;
+        }
+
+        for analysis in &bed_analysis.right_side {
+            if let Some(split_sensors) = &args.split_sensors {
+                if *split_sensors == true {
+                    write_analysis_to_csv(prefix, "right", analysis.period_num, &analysis.sensor1)?;
+                    write_analysis_to_csv(
+                        prefix,
+                        "right2",
+                        analysis.period_num,
+                        &analysis.sensor2,
+                    )?;
+                }
+            }
+            write_analysis_to_csv(
+                prefix,
+                "right_combined",
+                analysis.period_num,
+                &analysis.combined,
+            )?;
+        }
+    }
 
     Ok(())
 }
