@@ -31,6 +31,10 @@ struct Args {
     #[arg(long, env = "CSV_OUTPUT")]
     csv_output: Option<String>,
 
+    /// Window size for smoothing HR results
+    #[arg(long, env = "HR_SMOOTHING_WINDOW", default_value = "60")]
+    hr_smoothing_window: Option<usize>,
+
     /// Split sensors into separate CSV files
     #[arg(long, env = "SPLIT_SENSORS")]
     split_sensors: Option<bool>,
@@ -879,6 +883,7 @@ fn write_analysis_to_csv(
     sensor_id: &str,
     period_num: usize,
     analysis: &PeriodAnalysis,
+    hr_smoothing_window: usize,
 ) -> anyhow::Result<()> {
     let path = std::path::Path::new(base_path);
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -903,8 +908,11 @@ fn write_analysis_to_csv(
     timestamps.dedup();
 
     // Interpolate and smooth heart rates
-    let smoothed_fft_hr =
-        heart_analysis::interpolate_and_smooth(&timestamps, &analysis.fft_heart_rates, 60);
+    let smoothed_fft_hr = heart_analysis::interpolate_and_smooth(
+        &timestamps,
+        &analysis.fft_heart_rates,
+        hr_smoothing_window,
+    );
 
     // Write header
     writer.write_record(&["timestamp", "fft_hr", "fft_hr_smoothed", "breathing_rate"])?;
@@ -1046,13 +1054,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Analyze the raw data during bed presence periods
     let bed_analysis = analyze_bed_presence_periods(&raw_sensor_data, &all_processed_data)?;
 
+    let hr_smoothing_window = args.hr_smoothing_window.unwrap_or(60);
+
     // Write CSV files if output prefix was provided
     if let Some(prefix) = &args.csv_output {
         for analysis in &bed_analysis.left_side {
             if let Some(split_sensors) = &args.split_sensors {
                 if *split_sensors == true {
-                    write_analysis_to_csv(prefix, "left", analysis.period_num, &analysis.sensor1)?;
-                    write_analysis_to_csv(prefix, "left2", analysis.period_num, &analysis.sensor2)?;
+                    write_analysis_to_csv(
+                        prefix,
+                        "left",
+                        analysis.period_num,
+                        &analysis.sensor1,
+                        hr_smoothing_window,
+                    )?;
+                    write_analysis_to_csv(
+                        prefix,
+                        "left2",
+                        analysis.period_num,
+                        &analysis.sensor2,
+                        hr_smoothing_window,
+                    )?;
                 }
             }
             write_analysis_to_csv(
@@ -1060,18 +1082,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "left_combined",
                 analysis.period_num,
                 &analysis.combined,
+                hr_smoothing_window,
             )?;
         }
 
         for analysis in &bed_analysis.right_side {
             if let Some(split_sensors) = &args.split_sensors {
                 if *split_sensors == true {
-                    write_analysis_to_csv(prefix, "right", analysis.period_num, &analysis.sensor1)?;
+                    write_analysis_to_csv(
+                        prefix,
+                        "right",
+                        analysis.period_num,
+                        &analysis.sensor1,
+                        hr_smoothing_window,
+                    )?;
                     write_analysis_to_csv(
                         prefix,
                         "right2",
                         analysis.period_num,
                         &analysis.sensor2,
+                        hr_smoothing_window,
                     )?;
                 }
             }
@@ -1080,6 +1110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "right_combined",
                 analysis.period_num,
                 &analysis.combined,
+                hr_smoothing_window,
             )?;
         }
     }

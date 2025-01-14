@@ -181,8 +181,8 @@ pub fn analyze_heart_rate_fft(
     // Calculate frequency resolution
     let freq_resolution = sample_rate / signal.len() as f32;
 
-    // Look at magnitude spectrum in the heart rate range (45-100 BPM = 0.75-1.67 Hz)
-    let min_bin = (0.75 / freq_resolution) as usize;
+    // Look at magnitude spectrum in the heart rate range (40-100 BPM = 0.67-1.67 Hz)
+    let min_bin = (0.67 / freq_resolution) as usize;
     let max_bin = (1.67 / freq_resolution) as usize;
 
     // Find all peaks in the heart rate range
