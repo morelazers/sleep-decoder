@@ -104,15 +104,6 @@ struct BedPresence {
 }
 
 #[derive(Debug)]
-struct RawPeriodData {
-    timestamp: DateTime<Utc>,
-    left1: Vec<u8>,
-    left2: Vec<u8>,
-    right1: Vec<u8>,
-    right2: Vec<u8>,
-}
-
-#[derive(Debug)]
 struct PeriodAnalysis {
     fft_heart_rates: Vec<(DateTime<Utc>, f32)>, // Results from FFT analysis
     breathing_rates: Vec<(DateTime<Utc>, f32)>, // Results from breathing analysis
@@ -130,6 +121,85 @@ struct SideAnalysis {
 struct BedAnalysis {
     left_side: Vec<SideAnalysis>,
     right_side: Vec<SideAnalysis>,
+}
+
+pub struct RawDataView<'a> {
+    raw_data: &'a [(u32, SensorData)],
+    start_idx: usize,
+    end_idx: usize,
+}
+
+impl<'a> RawDataView<'a> {
+    pub fn get_data_at(&self, idx: usize) -> Option<RawPeriodData<'a>> {
+        if idx >= self.end_idx - self.start_idx {
+            return None;
+        }
+
+        if let SensorData::PiezoDual {
+            ts,
+            left1,
+            left2,
+            right1,
+            right2,
+            ..
+        } = &self.raw_data[self.start_idx + idx].1
+        {
+            Some(RawPeriodData {
+                timestamp: DateTime::from_timestamp(*ts, 0).unwrap(),
+                left1,
+                left2,
+                right1,
+                right2,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end_idx - self.start_idx
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug)]
+pub struct RawPeriodData<'a> {
+    pub timestamp: DateTime<Utc>,
+    pub left1: &'a [u8],
+    pub left2: &'a [u8],
+    pub right1: &'a [u8],
+    pub right2: &'a [u8],
+}
+
+fn create_raw_data_view<'a>(
+    raw_sensor_data: &'a [(u32, SensorData)],
+    period: &'_ BedPresence,
+) -> RawDataView<'a> {
+    let start_idx = raw_sensor_data.partition_point(|(_, data)| {
+        if let SensorData::PiezoDual { ts, .. } = data {
+            DateTime::from_timestamp(*ts, 0).unwrap() < period.start
+        } else {
+            true
+        }
+    });
+
+    let end_idx = start_idx
+        + raw_sensor_data[start_idx..].partition_point(|(_, data)| {
+            if let SensorData::PiezoDual { ts, .. } = data {
+                DateTime::from_timestamp(*ts, 0).unwrap() <= period.end
+            } else {
+                false
+            }
+        });
+
+    RawDataView {
+        raw_data: raw_sensor_data,
+        start_idx,
+        end_idx,
+    }
 }
 
 fn calculate_stats(data: &[i32]) -> (f32, f32) {
@@ -222,16 +292,22 @@ fn remove_stat_outliers_for_sensor(data: &mut Vec<ProcessedData>, sensor: &str) 
     let len_before = data.len();
 
     // Calculate percentiles for mean
-    let mut sorted_means = mean_data.clone();
-    sorted_means.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean_lower = sorted_means[(data.len() as f32 * 0.02) as usize];
-    let mean_upper = sorted_means[(data.len() as f32 * 0.98) as usize];
+    let mean_percentiles = {
+        let mut indices: Vec<usize> = (0..mean_data.len()).collect();
+        indices.sort_by(|&a, &b| mean_data[a].partial_cmp(&mean_data[b]).unwrap());
+        let mean_lower = mean_data[indices[(data.len() as f32 * 0.02) as usize]];
+        let mean_upper = mean_data[indices[(data.len() as f32 * 0.98) as usize]];
+        (mean_lower, mean_upper)
+    };
 
     // Calculate percentiles for std
-    let mut sorted_stds = std_data.clone();
-    sorted_stds.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let std_lower = sorted_stds[(data.len() as f32 * 0.02) as usize];
-    let std_upper = sorted_stds[(data.len() as f32 * 0.98) as usize];
+    let std_percentiles = {
+        let mut indices: Vec<usize> = (0..std_data.len()).collect();
+        indices.sort_by(|&a, &b| std_data[a].partial_cmp(&std_data[b]).unwrap());
+        let std_lower = std_data[indices[(data.len() as f32 * 0.02) as usize]];
+        let std_upper = std_data[indices[(data.len() as f32 * 0.98) as usize]];
+        (std_lower, std_upper)
+    };
 
     // Filter data
     data.retain(|d| {
@@ -242,7 +318,10 @@ fn remove_stat_outliers_for_sensor(data: &mut Vec<ProcessedData>, sensor: &str) 
             "right2" => (d.right2_mean, d.right2_std),
             _ => unreachable!(),
         };
-        mean >= mean_lower && mean <= mean_upper && std >= std_lower && std <= std_upper
+        mean >= mean_percentiles.0
+            && mean <= mean_percentiles.1
+            && std >= std_percentiles.0
+            && std <= std_percentiles.1
     });
 
     println!(
@@ -523,46 +602,18 @@ fn detect_bed_presence(data: &[ProcessedData], side: &str) -> Vec<BedPresence> {
     merged_periods
 }
 
-fn extract_raw_data_for_period(
-    raw_sensor_data: &[(u32, SensorData)],
+fn extract_raw_data_for_period<'a>(
+    raw_sensor_data: &'a [(u32, SensorData)],
     period: &BedPresence,
-) -> Vec<RawPeriodData> {
-    raw_sensor_data
-        .iter()
-        .filter_map(|(_, data)| {
-            if let SensorData::PiezoDual {
-                ts,
-                left1,
-                left2,
-                right1,
-                right2,
-                ..
-            } = data
-            {
-                let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
-                if timestamp >= period.start && timestamp <= period.end {
-                    Some(RawPeriodData {
-                        timestamp,
-                        left1: left1.clone(),
-                        left2: left2.clone(),
-                        right1: right1.clone(),
-                        right2: right2.clone(),
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect()
+) -> RawDataView<'a> {
+    create_raw_data_view(raw_sensor_data, period)
 }
 
 mod heart_analysis;
 
 fn analyse_sensor_data(
     signal: &[i32],
-    raw_data: &[RawPeriodData],
+    raw_data: &RawDataView,
     samples_per_segment_hr: usize,
     step_size_hr: usize,
     samples_per_segment_br: usize,
@@ -572,80 +623,53 @@ fn analyse_sensor_data(
     let mut breathing_rates = Vec::new();
     let mut prev_fft_hr = None;
 
-    // Create heart rate history tracker with 15-minute window
-    let mut hr_history = heart_analysis::HeartRateHistory::new(15.0 * 60.0); // 15 minutes in seconds
+    // Create FFT contexts for both heart rate and breathing rate
+    let mut hr_fft_context = heart_analysis::FftContext::new(samples_per_segment_hr);
+    let mut br_fft_context = heart_analysis::FftContext::new(samples_per_segment_br);
+    let mut hr_history = heart_analysis::HeartRateHistory::new(15.0 * 60.0);
 
-    // Process segments for heart rate analysis
-    let total_samples = signal.len();
-    let num_segments_hr = (total_samples - samples_per_segment_hr) / step_size_hr + 1;
+    // Process heart rate windows...
+    let hr_windows = heart_analysis::SignalWindowIterator::new(
+        signal,
+        raw_data,
+        samples_per_segment_hr,
+        step_size_hr,
+        500.0,
+    );
 
-    for segment_idx in 0..num_segments_hr {
-        let start_sample = segment_idx * step_size_hr;
-        let end_sample = (start_sample + samples_per_segment_hr).min(total_samples);
+    let time_step = samples_per_segment_hr as f32 / 500.0;
 
-        // Skip if we don't have enough samples for a full segment
-        if end_sample - start_sample < samples_per_segment_hr / 2 {
-            continue;
-        }
-
-        // Extract segment and get timestamp
-        let segment = &signal[start_sample..end_sample];
-        let segment_time = raw_data[start_sample / 500].timestamp;
-
-        // Process segment as before...
-        let cleaned_segment = heart_analysis::interpolate_outliers(segment, 2);
-        let segment_f32: Vec<f32> = cleaned_segment.iter().map(|&x| x as f32).collect();
-        let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
-        let processed_segment =
-            heart_analysis::remove_baseline_wander(&scaled_segment, 500.0, 0.05);
-
-        // Calculate time step
-        let time_step = samples_per_segment_hr as f32 / 500.0;
-
-        // Analyze heart rate with history tracking
+    for window in hr_windows {
         if let Some(fft_hr) = heart_analysis::analyze_heart_rate_fft(
-            &processed_segment,
+            &window.processed_signal,
             500.0,
             prev_fft_hr,
-            segment_time,
+            window.timestamp,
             &mut hr_history,
+            &mut hr_fft_context,
             time_step,
         ) {
-            fft_heart_rates.push((segment_time, fft_hr));
+            fft_heart_rates.push((window.timestamp, fft_hr));
             prev_fft_hr = Some(fft_hr);
         }
     }
 
-    // Process segments for breathing rate analysis
-    let num_segments_br = (total_samples - samples_per_segment_br) / step_size_br + 1;
+    // Process breathing rate windows...
+    let br_windows = heart_analysis::SignalWindowIterator::new(
+        signal,
+        raw_data,
+        samples_per_segment_br,
+        step_size_br,
+        500.0,
+    );
 
-    for segment_idx in 0..num_segments_br {
-        let start_sample = segment_idx * step_size_br;
-        let end_sample = (start_sample + samples_per_segment_br).min(total_samples);
-
-        // Skip if we don't have enough samples for a full segment
-        if end_sample - start_sample < samples_per_segment_br / 2 {
-            continue;
-        }
-
-        // Extract segment
-        let segment = &signal[start_sample..end_sample];
-        let segment_time = raw_data[start_sample / 500].timestamp;
-
-        // Remove outliers from the segment
-        let cleaned_segment = heart_analysis::interpolate_outliers(segment, 2);
-
-        // Convert to f32 for processing
-        let segment_f32: Vec<f32> = cleaned_segment.iter().map(|&x| x as f32).collect();
-
-        // Scale the segment for breathing rate analysis
-        let scaled_segment = heart_analysis::scale_data(&segment_f32, 0.0, 1024.0);
-
-        // Analyze breathing rate
-        if let Some(breathing_rate) =
-            heart_analysis::analyze_breathing_rate_fft(&scaled_segment, 500.0)
-        {
-            breathing_rates.push((segment_time, breathing_rate));
+    for window in br_windows {
+        if let Some(breathing_rate) = heart_analysis::analyze_breathing_rate_fft(
+            &window.processed_signal,
+            500.0,
+            &mut br_fft_context, // Pass the breathing rate FFT context
+        ) {
+            breathing_rates.push((window.timestamp, breathing_rate));
         }
     }
 
@@ -728,156 +752,146 @@ fn analyze_bed_presence_periods(
         );
 
         // Extract and analyze raw data for the entire period
-        let raw_data = extract_raw_data_for_period(raw_sensor_data, period);
-        println!("  Found {} raw data points", raw_data.len());
+        let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        if !raw_data.is_empty() {
-            // Extract signals
-            let signal1: Vec<i32> = raw_data
-                .iter()
-                .flat_map(|d| {
-                    d.left1
-                        .chunks_exact(4)
-                        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                })
-                .collect();
+        // Extract signals
+        let signal1: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.left1
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
 
-            let signal2: Vec<i32> = raw_data
-                .iter()
-                .flat_map(|d| {
-                    d.left2
-                        .chunks_exact(4)
-                        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                })
-                .collect();
+        let signal2: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.left2
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
 
-            println!("\n  Analyzing left side period...");
-            let analysis1 = analyse_sensor_data(
-                &signal1,
-                &raw_data,
-                samples_per_segment_hr,
-                step_size_hr,
-                samples_per_segment_br,
-                step_size_br,
-            );
+        println!("\n  Analyzing left side period...");
+        let analysis1 = analyse_sensor_data(
+            &signal1,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
 
-            let analysis2 = analyse_sensor_data(
-                &signal2,
-                &raw_data,
-                samples_per_segment_hr,
-                step_size_hr,
-                samples_per_segment_br,
-                step_size_br,
-            );
+        let analysis2 = analyse_sensor_data(
+            &signal2,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
 
-            // Combine signals by averaging
-            let combined_signal: Vec<i32> = signal1
-                .iter()
-                .zip(signal2.iter())
-                .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-                .collect();
+        // Combine signals by averaging
+        let combined_signal: Vec<i32> = signal1
+            .iter()
+            .zip(signal2.iter())
+            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+            .collect();
 
-            let analysis_combined = analyse_sensor_data(
-                &combined_signal,
-                &raw_data,
-                samples_per_segment_hr,
-                step_size_hr,
-                samples_per_segment_br,
-                step_size_br,
-            );
+        let analysis_combined = analyse_sensor_data(
+            &combined_signal,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
 
-            bed_analysis.left_side.push(SideAnalysis {
-                sensor1: analysis1,
-                sensor2: analysis2,
-                combined: analysis_combined,
-                period_num: i,
-            });
-        } else {
-            println!("  No raw data found for this period!");
-        }
+        bed_analysis.left_side.push(SideAnalysis {
+            sensor1: analysis1,
+            sensor2: analysis2,
+            combined: analysis_combined,
+            period_num: i,
+        });
+    }
 
-        // Analyze right side periods
-        for (i, period) in right_periods.iter().enumerate() {
-            println!("\nRight side period {}", i + 1);
-            println!(
-                "  {} to {}",
-                period.start.format("%Y-%m-%d %H:%M"),
-                period.end.format("%Y-%m-%d %H:%M")
-            );
-            println!(
-                "  Duration: {} minutes",
-                (period.end - period.start).num_minutes()
-            );
+    // Analyze right side periods
+    for (i, period) in right_periods.iter().enumerate() {
+        println!("\nRight side period {}", i + 1);
+        println!(
+            "  {} to {}",
+            period.start.format("%Y-%m-%d %H:%M"),
+            period.end.format("%Y-%m-%d %H:%M")
+        );
+        println!(
+            "  Duration: {} minutes",
+            (period.end - period.start).num_minutes()
+        );
 
-            // Extract and analyze raw data for the entire period
-            let raw_data = extract_raw_data_for_period(raw_sensor_data, period);
-            println!("  Found {} raw data points", raw_data.len());
+        // Extract and analyze raw data for the entire period
+        let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-            if !raw_data.is_empty() {
-                // Extract signals
-                let signal1: Vec<i32> = raw_data
-                    .iter()
-                    .flat_map(|d| {
-                        d.right1.chunks_exact(4).map(|chunk| {
-                            i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        })
-                    })
-                    .collect();
+        // Extract signals
+        let signal1: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.right1
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
 
-                let signal2: Vec<i32> = raw_data
-                    .iter()
-                    .flat_map(|d| {
-                        d.right2.chunks_exact(4).map(|chunk| {
-                            i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        })
-                    })
-                    .collect();
+        let signal2: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.right2
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
 
-                println!("\n  Analyzing right side period...");
-                let analysis1 = analyse_sensor_data(
-                    &signal1,
-                    &raw_data,
-                    samples_per_segment_hr,
-                    step_size_hr,
-                    samples_per_segment_br,
-                    step_size_br,
-                );
+        println!("\n  Analyzing right side period...");
+        let analysis1 = analyse_sensor_data(
+            &signal1,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
 
-                let analysis2 = analyse_sensor_data(
-                    &signal2,
-                    &raw_data,
-                    samples_per_segment_hr,
-                    step_size_hr,
-                    samples_per_segment_br,
-                    step_size_br,
-                );
+        let analysis2 = analyse_sensor_data(
+            &signal2,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
 
-                // Combine signals by averaging
-                let combined_signal: Vec<i32> = signal1
-                    .iter()
-                    .zip(signal2.iter())
-                    .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-                    .collect();
+        // Combine signals by averaging
+        let combined_signal: Vec<i32> = signal1
+            .iter()
+            .zip(signal2.iter())
+            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+            .collect();
 
-                let analysis_combined = analyse_sensor_data(
-                    &combined_signal,
-                    &raw_data,
-                    samples_per_segment_hr,
-                    step_size_hr,
-                    samples_per_segment_br,
-                    step_size_br,
-                );
+        let analysis_combined = analyse_sensor_data(
+            &combined_signal,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
 
-                bed_analysis.right_side.push(SideAnalysis {
-                    sensor1: analysis1,
-                    sensor2: analysis2,
-                    combined: analysis_combined,
-                    period_num: i,
-                });
-            } else {
-                println!("  No raw data found for this period!");
-            }
-        }
+        bed_analysis.right_side.push(SideAnalysis {
+            sensor1: analysis1,
+            sensor2: analysis2,
+            combined: analysis_combined,
+            period_num: i,
+        });
     }
 
     Ok(bed_analysis)
