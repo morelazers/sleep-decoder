@@ -679,187 +679,218 @@ fn analyse_sensor_data(
     }
 }
 
-/// Analyze a single period of data for both sides
-fn analyze_period(
+fn analyze_bed_presence_periods(
     raw_sensor_data: &[(u32, SensorData)],
-    period: &BedPresence,
-    window_params: &WindowParameters,
-) -> anyhow::Result<(SideAnalysis, SideAnalysis)> {
-    let raw_data_view = create_raw_data_view(raw_sensor_data, period);
-
-    // Helper function to extract signal data
-    let extract_signal = |data: &[u8]| -> Vec<i32> {
-        data.chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()
+    left_periods: &[BedPresence],
+    right_periods: &[BedPresence],
+) -> anyhow::Result<BedAnalysis> {
+    let mut bed_analysis = BedAnalysis {
+        left_side: Vec::new(),
+        right_side: Vec::new(),
     };
 
-    // Extract all signals at once
-    let (left1, left2, right1, right2): (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) = (0
-        ..raw_data_view.len())
-        .filter_map(|idx| raw_data_view.get_data_at(idx))
-        .map(|data| {
-            (
-                extract_signal(data.left1),
-                extract_signal(data.left2),
-                extract_signal(data.right1),
-                extract_signal(data.right2),
-            )
-        })
-        .fold(
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-            |mut acc, (l1, l2, r1, r2)| {
-                acc.0.extend(l1);
-                acc.1.extend(l2);
-                acc.2.extend(r1);
-                acc.3.extend(r2);
-                acc
-            },
+    println!("\nAnalyzing bed presence periods:");
+
+    // Get segment width and overlap from environment variables or use defaults
+    let segment_width_hr: f32 = env::var("HR_WINDOW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10.0);
+
+    let overlap_percent_hr: f32 = env::var("HR_WINDOW_OVERLAP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.1);
+
+    let segment_width_br: f32 = env::var("BR_WINDOW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120.0);
+
+    let overlap_percent_br: f32 = env::var("BR_WINDOW_OVERLAP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+
+    let samples_per_segment_hr = (segment_width_hr * 500.0) as usize;
+    let overlap_samples_hr = (samples_per_segment_hr as f32 * overlap_percent_hr) as usize;
+    let step_size_hr = samples_per_segment_hr - overlap_samples_hr;
+
+    let samples_per_segment_br = (segment_width_br * 500.0) as usize;
+    let overlap_samples_br = (samples_per_segment_br as f32 * overlap_percent_br) as usize;
+    let step_size_br = samples_per_segment_br - overlap_samples_br;
+
+    println!("\n  Processing with:");
+    println!("    (hr) Segment width : {} seconds", segment_width_hr);
+    println!("    (hr) Overlap: {}%", overlap_percent_hr * 100.0);
+    println!("    (hr) Samples per segment: {}", samples_per_segment_hr);
+    println!("    (hr) Overlap samples: {}", overlap_samples_hr);
+    println!("    (hr) Step size: {} samples", step_size_hr);
+
+    println!("\n  --:");
+    println!("    (br) Segment width : {} seconds", segment_width_br);
+    println!("    (br) Overlap: {}%", overlap_percent_br * 100.0);
+    println!("    (br) Samples per segment: {}", samples_per_segment_br);
+    println!("    (br) Overlap samples: {}", overlap_samples_br);
+    println!("    (br) Step size: {} samples", step_size_br);
+
+    // Analyze left side periods
+    for (i, period) in left_periods.iter().enumerate() {
+        println!("\nLeft side period {}", i + 1);
+        println!(
+            "  {} to {}",
+            period.start.format("%Y-%m-%d %H:%M"),
+            period.end.format("%Y-%m-%d %H:%M")
+        );
+        println!(
+            "  Duration: {} minutes",
+            (period.end - period.start).num_minutes()
         );
 
-    // Helper function to combine signals
-    let combine_signals = |signal1: &[i32], signal2: &[i32]| -> Vec<i32> {
-        signal1
-            .iter()
-            .zip(signal2.iter())
-            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-            .collect()
-    };
+        // Extract and analyze raw data for the entire period
+        let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-    // Analyze left side
-    let left_analysis1 = analyse_sensor_data(
-        &left1,
-        &raw_data_view,
-        window_params.samples_per_segment_hr,
-        window_params.step_size_hr,
-        window_params.samples_per_segment_br,
-        window_params.step_size_br,
-    );
+        // Extract signals
+        let signal1: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.left1
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
 
-    let left_analysis2 = analyse_sensor_data(
-        &left2,
-        &raw_data_view,
-        window_params.samples_per_segment_hr,
-        window_params.step_size_hr,
-        window_params.samples_per_segment_br,
-        window_params.step_size_br,
-    );
+        let signal2: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.left2
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
 
-    let left_combined = combine_signals(&left1, &left2);
-    let left_analysis_combined = analyse_sensor_data(
-        &left_combined,
-        &raw_data_view,
-        window_params.samples_per_segment_hr,
-        window_params.step_size_hr,
-        window_params.samples_per_segment_br,
-        window_params.step_size_br,
-    );
-
-    // Analyze right side
-    let right_analysis1 = analyse_sensor_data(
-        &right1,
-        &raw_data_view,
-        window_params.samples_per_segment_hr,
-        window_params.step_size_hr,
-        window_params.samples_per_segment_br,
-        window_params.step_size_br,
-    );
-
-    let right_analysis2 = analyse_sensor_data(
-        &right2,
-        &raw_data_view,
-        window_params.samples_per_segment_hr,
-        window_params.step_size_hr,
-        window_params.samples_per_segment_br,
-        window_params.step_size_br,
-    );
-
-    let right_combined = combine_signals(&right1, &right2);
-    let right_analysis_combined = analyse_sensor_data(
-        &right_combined,
-        &raw_data_view,
-        window_params.samples_per_segment_hr,
-        window_params.step_size_hr,
-        window_params.samples_per_segment_br,
-        window_params.step_size_br,
-    );
-
-    Ok((
-        SideAnalysis {
-            sensor1: left_analysis1,
-            sensor2: left_analysis2,
-            combined: left_analysis_combined,
-            period_num: 0,
-        },
-        SideAnalysis {
-            sensor1: right_analysis1,
-            sensor2: right_analysis2,
-            combined: right_analysis_combined,
-            period_num: 0,
-        },
-    ))
-}
-
-/// Parameters for window-based analysis
-struct WindowParameters {
-    samples_per_segment_hr: usize,
-    step_size_hr: usize,
-    samples_per_segment_br: usize,
-    step_size_br: usize,
-}
-
-impl WindowParameters {
-    fn from_env() -> Self {
-        let segment_width_hr: f32 = env::var("HR_WINDOW_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10.0);
-
-        let overlap_percent_hr: f32 = env::var("HR_WINDOW_OVERLAP_PERCENT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.1);
-
-        let segment_width_br: f32 = env::var("BR_WINDOW_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120.0);
-
-        let overlap_percent_br: f32 = env::var("BR_WINDOW_OVERLAP_PERCENT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0);
-
-        let samples_per_segment_hr = (segment_width_hr * 500.0) as usize;
-        let overlap_samples_hr = (samples_per_segment_hr as f32 * overlap_percent_hr) as usize;
-        let step_size_hr = samples_per_segment_hr - overlap_samples_hr;
-
-        let samples_per_segment_br = (segment_width_br * 500.0) as usize;
-        let overlap_samples_br = (samples_per_segment_br as f32 * overlap_percent_br) as usize;
-        let step_size_br = samples_per_segment_br - overlap_samples_br;
-
-        Self {
+        println!("\n  Analyzing left side period...");
+        let analysis1 = analyse_sensor_data(
+            &signal1,
+            &raw_data_view,
             samples_per_segment_hr,
             step_size_hr,
             samples_per_segment_br,
             step_size_br,
-        }
+        );
+
+        let analysis2 = analyse_sensor_data(
+            &signal2,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
+
+        // Combine signals by averaging
+        let combined_signal: Vec<i32> = signal1
+            .iter()
+            .zip(signal2.iter())
+            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+            .collect();
+
+        let analysis_combined = analyse_sensor_data(
+            &combined_signal,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
+
+        bed_analysis.left_side.push(SideAnalysis {
+            sensor1: analysis1,
+            sensor2: analysis2,
+            combined: analysis_combined,
+            period_num: i,
+        });
     }
 
-    fn print_info(&self) {
-        println!("\n  Processing with:");
+    // Analyze right side periods
+    for (i, period) in right_periods.iter().enumerate() {
+        println!("\nRight side period {}", i + 1);
         println!(
-            "    (hr) Samples per segment: {}",
-            self.samples_per_segment_hr
+            "  {} to {}",
+            period.start.format("%Y-%m-%d %H:%M"),
+            period.end.format("%Y-%m-%d %H:%M")
         );
-        println!("    (hr) Step size: {} samples", self.step_size_hr);
-        println!("\n  --:");
         println!(
-            "    (br) Samples per segment: {}",
-            self.samples_per_segment_br
+            "  Duration: {} minutes",
+            (period.end - period.start).num_minutes()
         );
-        println!("    (br) Step size: {} samples", self.step_size_br);
+
+        // Extract and analyze raw data for the entire period
+        let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
+
+        // Extract signals
+        let signal1: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.right1
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
+
+        let signal2: Vec<i32> = (0..raw_data_view.len())
+            .filter_map(|idx| raw_data_view.get_data_at(idx))
+            .flat_map(|data| {
+                data.right2
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            })
+            .collect();
+
+        println!("\n  Analyzing right side period...");
+        let analysis1 = analyse_sensor_data(
+            &signal1,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
+
+        let analysis2 = analyse_sensor_data(
+            &signal2,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
+
+        // Combine signals by averaging
+        let combined_signal: Vec<i32> = signal1
+            .iter()
+            .zip(signal2.iter())
+            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+            .collect();
+
+        let analysis_combined = analyse_sensor_data(
+            &combined_signal,
+            &raw_data_view,
+            samples_per_segment_hr,
+            step_size_hr,
+            samples_per_segment_br,
+            step_size_br,
+        );
+
+        bed_analysis.right_side.push(SideAnalysis {
+            sensor1: analysis1,
+            sensor2: analysis2,
+            combined: analysis_combined,
+            period_num: i,
+        });
     }
+
+    Ok(bed_analysis)
 }
 
 fn write_analysis_to_csv(
@@ -1035,86 +1066,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Scale the data
     scale_data(&mut all_processed_data);
 
-    // Get window parameters
-    let window_params = WindowParameters::from_env();
-    window_params.print_info();
-
-    // If start/end times are provided, use those directly instead of presence detection
-    let bed_analysis = if args.start_time.is_some() || args.end_time.is_some() {
+    // Determine bed presence periods based on whether time window is specified
+    let (left_periods, right_periods) = if args.start_time.is_some() || args.end_time.is_some() {
         let end_time = match args.end_time {
             Some(ref t) => parse_datetime(t)?,
             None => Utc::now(),
         };
+
         let start_time = match args.start_time {
             Some(ref t) => parse_datetime(t)?,
             None => end_time - chrono::Duration::days(1),
         };
 
-        // Create a single period for the specified time window
-        let period = BedPresence {
+        // Create a single period for both sides
+        let single_period = BedPresence {
             start: start_time,
             end: end_time,
-            confidence: 1.0, // Maximum confidence since this is user-specified
+            confidence: 1.0,
         };
 
-        let (left_analysis, right_analysis) =
-            analyze_period(&raw_sensor_data, &period, &window_params)?;
-
-        BedAnalysis {
-            left_side: vec![left_analysis],
-            right_side: vec![right_analysis],
-        }
+        // Use the same period for both sides
+        (vec![single_period.clone()], vec![single_period])
     } else {
-        // Use normal presence detection
-        let mut bed_analysis = BedAnalysis {
-            left_side: Vec::new(),
-            right_side: Vec::new(),
-        };
-
-        // Detect presence for both sides
-        let left_periods = detect_bed_presence(&all_processed_data, "left");
-        let right_periods = detect_bed_presence(&all_processed_data, "right");
-
-        println!("\nAnalyzing bed presence periods:");
-
-        // Analyze left side periods
-        for (i, period) in left_periods.iter().enumerate() {
-            println!("\nLeft side period {}", i + 1);
-            println!(
-                "  {} to {}",
-                period.start.format("%Y-%m-%d %H:%M"),
-                period.end.format("%Y-%m-%d %H:%M")
-            );
-            println!(
-                "  Duration: {} minutes",
-                (period.end - period.start).num_minutes()
-            );
-
-            let (mut left_analysis, _) = analyze_period(&raw_sensor_data, period, &window_params)?;
-            left_analysis.period_num = i;
-            bed_analysis.left_side.push(left_analysis);
-        }
-
-        // Analyze right side periods
-        for (i, period) in right_periods.iter().enumerate() {
-            println!("\nRight side period {}", i + 1);
-            println!(
-                "  {} to {}",
-                period.start.format("%Y-%m-%d %H:%M"),
-                period.end.format("%Y-%m-%d %H:%M")
-            );
-            println!(
-                "  Duration: {} minutes",
-                (period.end - period.start).num_minutes()
-            );
-
-            let (_, mut right_analysis) = analyze_period(&raw_sensor_data, period, &window_params)?;
-            right_analysis.period_num = i;
-            bed_analysis.right_side.push(right_analysis);
-        }
-
-        bed_analysis
+        // Use detection method when no time window is specified
+        (
+            detect_bed_presence(&all_processed_data, "left"),
+            detect_bed_presence(&all_processed_data, "right"),
+        )
     };
+
+    // Print period information
+    println!("\nDetected bed presence periods:");
+    println!("Left side periods: {}", left_periods.len());
+    println!("Right side periods: {}", right_periods.len());
+
+    let bed_analysis =
+        analyze_bed_presence_periods(&raw_sensor_data, &left_periods, &right_periods)?;
 
     let hr_smoothing_window = args.hr_smoothing_window.unwrap_or(60);
 
