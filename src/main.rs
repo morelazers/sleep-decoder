@@ -637,7 +637,7 @@ fn analyse_sensor_data(
         500.0,
     );
 
-    // Collect breathing rates with timestamps
+    // Collect breathing rates
     for window in br_windows {
         if let Some(breathing_rate) = heart_analysis::analyze_breathing_rate_fft(
             &window.processed_signal,
@@ -647,6 +647,29 @@ fn analyse_sensor_data(
             breathing_rates.push((window.timestamp, breathing_rate));
         }
     }
+
+    // Calculate breathing rate stability using a rolling window
+    let window_size = 5; // Use 5 measurements for stability calculation
+    let breathing_rates_with_stability: Vec<(DateTime<Utc>, f32, f32)> = breathing_rates
+        .iter()
+        .enumerate()
+        .map(|(i, &(timestamp, rate))| {
+            // Get window of measurements centered on current point
+            let start = i.saturating_sub(window_size / 2);
+            let end = (i + window_size / 2 + 1).min(breathing_rates.len());
+            let window = &breathing_rates[start..end];
+
+            // Calculate local variance
+            let mean = window.iter().map(|(_, r)| r).sum::<f32>() / window.len() as f32;
+            let variance =
+                window.iter().map(|(_, r)| (r - mean).powi(2)).sum::<f32>() / window.len() as f32;
+
+            // Convert variance to stability score (0 to 1)
+            let stability = 1.0 / (1.0 + variance);
+
+            (timestamp, rate, stability)
+        })
+        .collect();
 
     // Process heart rate windows...
     let hr_windows = heart_analysis::SignalWindowIterator::new(
@@ -660,13 +683,13 @@ fn analyse_sensor_data(
     let time_step = samples_per_segment_hr as f32 / 500.0;
 
     for window in hr_windows {
-        // Find the closest breathing rate measurement
-        let breathing_rate = breathing_rates
+        // Find the closest breathing rate measurement with stability
+        let breathing_data = breathing_rates_with_stability
             .iter()
-            .min_by_key(|(br_time, _)| {
+            .min_by_key(|(br_time, _, _)| {
                 (br_time.timestamp() - window.timestamp.timestamp()).abs() as u64
             })
-            .map(|(_, rate)| *rate);
+            .map(|(_, rate, stability)| (*rate, *stability));
 
         if let Some(fft_hr) = heart_analysis::analyze_heart_rate_fft(
             &window.processed_signal,
@@ -676,7 +699,7 @@ fn analyse_sensor_data(
             &mut hr_history,
             &mut hr_fft_context,
             time_step,
-            breathing_rate,
+            breathing_data,
         ) {
             fft_heart_rates.push((window.timestamp, fft_hr));
             prev_fft_hr = Some(fft_hr);

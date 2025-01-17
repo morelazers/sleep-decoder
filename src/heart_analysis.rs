@@ -321,7 +321,7 @@ pub fn analyze_heart_rate_fft(
     history: &mut HeartRateHistory,
     fft_context: &mut FftContext,
     time_step: f32,
-    breathing_rate: Option<f32>,
+    breathing_data: Option<(f32, f32)>, // (rate, stability)
 ) -> Option<f32> {
     let quality = calculate_signal_quality(signal);
 
@@ -363,7 +363,7 @@ pub fn analyze_heart_rate_fft(
     let max_bin = (max_freq / freq_resolution) as usize;
 
     // Calculate breathing harmonics if available
-    let harmonic_freqs = breathing_rate.map(|br| {
+    let harmonic_freqs = breathing_data.map(|(br, _)| {
         let fundamental = br / 60.0; // Convert BPM to Hz
         vec![
             fundamental * 2.0, // Second harmonic
@@ -385,25 +385,29 @@ pub fn analyze_heart_rate_fft(
             let bpm = freq * 60.0;
 
             // Check if this peak is near a breathing harmonic
-            let harmonic_factor = if let Some(harmonics) = &harmonic_freqs {
-                let is_harmonic = harmonics.iter().any(|&h| (freq - h).abs() < 0.05);
-                if is_harmonic {
-                    // If we have a previous heart rate, check if this peak is close to it
-                    if let Some(prev_hr) = prev_hr {
-                        let freq_diff = (bpm - prev_hr).abs();
-                        if freq_diff < 5.0 {
-                            // If very close to previous HR, don't penalize
-                            1.0
-                        } else if freq_diff < 10.0 {
-                            // If somewhat close, apply mild penalty
-                            0.8
+            let harmonic_factor = if let Some((_, stability)) = breathing_data {
+                if let Some(harmonics) = &harmonic_freqs {
+                    let is_harmonic = harmonics.iter().any(|&h| (freq - h).abs() < 0.05);
+                    if is_harmonic {
+                        // If we have a previous heart rate, check if this peak is close to it
+                        if let Some(prev_hr) = prev_hr {
+                            let freq_diff = (bpm - prev_hr).abs();
+                            if freq_diff < 5.0 {
+                                // If very close to previous HR, don't penalize
+                                1.0
+                            } else {
+                                // Scale penalty by breathing stability
+                                // High stability (1.0) -> full penalty
+                                // Low stability (0.0) -> minimal penalty
+                                let base_penalty = if freq_diff < 10.0 { 0.8 } else { 0.5 };
+                                1.0 - (1.0 - base_penalty) * stability
+                            }
                         } else {
-                            // If far from previous HR, likely a harmonic
-                            0.5
+                            // No previous HR, scale penalty by stability
+                            1.0 - (0.5 * stability)
                         }
                     } else {
-                        // No previous HR to validate against
-                        0.5
+                        1.0
                     }
                 } else {
                     1.0
