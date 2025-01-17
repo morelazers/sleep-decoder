@@ -2,10 +2,7 @@ use super::RawDataView;
 use chrono::{DateTime, Utc};
 use log::debug;
 use rustfft::{num_complex::Complex, FftPlanner};
-use sci_rs::signal::filter::{
-    design::{butter_dyn, DigitalFilter, FilterBandType, FilterOutputType, Sos},
-    sosfiltfilt_dyn,
-};
+use sci_rs::signal::filter::{design::Sos, sosfiltfilt_dyn};
 use std::f32::consts::PI;
 
 /// Create a Hann window of the specified size
@@ -141,18 +138,23 @@ fn tf2sos(b: &[f32], a: &[f32]) -> Vec<[f32; 6]> {
 /// Calculate physiologically possible heart rate range based on previous HR
 fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
     // Reduce maximum allowed changes
-    const MAX_CHANGE_PER_MINUTE: f32 = 2.0;
+    const MAX_INSTANT_CHANGE: f32 = 6.0;
+    const MAX_GRADUAL_CHANGE: f32 = 1.5;
 
     // Calculate maximum possible change for this time step
-    let max_change = MAX_CHANGE_PER_MINUTE * time_step;
+    let max_change = if time_step <= 5.0 {
+        MAX_INSTANT_CHANGE * time_step
+    } else {
+        (MAX_INSTANT_CHANGE * 5.0) + (MAX_GRADUAL_CHANGE * (time_step - 5.0))
+    };
 
     // Make the range slightly asymmetric - less aggressive downward bias
-    let upward_change = max_change; // Changed from 0.7 - allow more upward movement
-    let downward_change = max_change; // Add small restriction to downward movement too
+    let upward_change = max_change * 0.85; // Changed from 0.7 - allow more upward movement
+    let downward_change = max_change * 0.9; // Add small restriction to downward movement too
 
     // Calculate range with smaller buffer
-    let min_hr = (prev_hr - downward_change - 3.0).max(40.0);
-    let max_hr = (prev_hr + upward_change + 3.0).min(85.0);
+    let min_hr = (prev_hr - downward_change - 3.0).max(35.0);
+    let max_hr = (prev_hr + upward_change + 3.0).min(95.0);
 
     // Less aggressive HR zone restrictions
     let max_hr = if prev_hr < 60.0 {
@@ -169,18 +171,44 @@ fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
     (min_hr, max_hr)
 }
 
+/// Calculate signal quality metric
+fn calculate_signal_quality(signal: &[f32]) -> f32 {
+    // Calculate signal variance
+    let mean = signal.iter().sum::<f32>() / signal.len() as f32;
+    let variance = signal.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / signal.len() as f32;
+
+    // Calculate zero crossings
+    let zero_crossings = signal
+        .windows(2)
+        .filter(|w| w[0].signum() != w[1].signum())
+        .count();
+
+    // Combine metrics (lower score = noisier signal)
+    let quality_score = 1.0 / (1.0 + variance * (zero_crossings as f32 / signal.len() as f32));
+
+    quality_score
+}
+
 /// Detect if a heart rate change is suspicious based on multiple criteria
-fn is_suspicious_change(bpm: f32, magnitude: f32, max_magnitude: f32, prev_hr: f32) -> bool {
+fn is_suspicious_change(
+    bpm: f32,
+    magnitude: f32,
+    max_magnitude: f32,
+    prev_hr: f32,
+    quality: f32,
+) -> bool {
     let hr_change = (bpm - prev_hr).abs();
     let normalized_magnitude = magnitude / max_magnitude;
 
     // Criteria for suspicious changes:
     // 1. Large change with weak peak
+    // 2. Change size relative to signal quality
     // 3. Magnitude threshold increases with larger changes
 
     let required_magnitude = 0.3 + (hr_change / 20.0).min(0.3); // Higher threshold for bigger changes
 
     (hr_change > 8.0 && normalized_magnitude < required_magnitude)
+        || (hr_change > 12.0 && quality < 0.4)
         || (hr_change > 15.0 && normalized_magnitude < 0.6)
 }
 
@@ -255,31 +283,18 @@ impl FftContext {
         }
     }
 
-    fn process(
-        &mut self,
-        signal: &[f32],
-        sample_rate: f32,
-        min_freq: f32,
-        max_freq: f32,
-    ) -> &[Complex<f32>] {
-        // Apply bandpass filter before windowing
-        let filtered = apply_hr_bandpass(signal, sample_rate, min_freq, max_freq);
-
+    fn process(&mut self, signal: &[f32]) -> &[Complex<f32>] {
         // Pad or truncate signal to match buffer size
         self.windowed_signal.clear();
-        if filtered.len() <= self.buffer_size {
+        if signal.len() <= self.buffer_size {
             // Pad with zeros
-            self.windowed_signal.extend(
-                filtered
-                    .iter()
-                    .zip(self.window.iter())
-                    .map(|(&s, &w)| s * w),
-            );
+            self.windowed_signal
+                .extend(signal.iter().zip(self.window.iter()).map(|(&s, &w)| s * w));
             self.windowed_signal.resize(self.buffer_size, 0.0);
         } else {
             // Truncate
             self.windowed_signal.extend(
-                filtered[..self.buffer_size]
+                signal[..self.buffer_size]
                     .iter()
                     .zip(self.window.iter())
                     .map(|(&s, &w)| s * w),
@@ -297,46 +312,7 @@ impl FftContext {
     }
 }
 
-/// Convert BPM to Hz
-fn bpm_to_hz(bpm: f32) -> f32 {
-    bpm / 60.0
-}
-
-/// Convert Hz to BPM
-fn hz_to_bpm(hz: f32) -> f32 {
-    hz * 60.0
-}
-
-/// Design a Butterworth bandpass filter for heart rate frequencies
-fn design_hr_bandpass(sample_rate: f32, min_freq: f32, max_freq: f32) -> DigitalFilter<f32> {
-    // Normalize frequencies to Nyquist frequency
-    let nyquist = sample_rate / 2.0;
-    let low_freq = min_freq / nyquist;
-    let high_freq = max_freq / nyquist;
-    let order = 4; // 4th order filter
-
-    // Create bandpass filter using butter_dyn
-    butter_dyn(
-        order,                          // Filter order
-        vec![low_freq, high_freq],      // Cutoff frequencies (normalized)
-        Some(FilterBandType::Bandpass), // Filter type
-        Some(false),                    // Analog filter flag
-        Some(FilterOutputType::Sos),    // Output format
-        None,                           // Sample rate (not needed for normalized freqs)
-    )
-}
-
-/// Apply bandpass filter to the signal
-fn apply_hr_bandpass(signal: &[f32], sample_rate: f32, min_freq: f32, max_freq: f32) -> Vec<f32> {
-    let filter = design_hr_bandpass(sample_rate, min_freq, max_freq);
-    let sos = match filter {
-        DigitalFilter::Sos(sos) => sos.sos,
-        _ => panic!("Expected a SOS filter"),
-    };
-    sosfiltfilt_dyn(signal.iter(), &sos)
-}
-
-/// Modify the heart rate analysis function to use frequency ranges
+/// Modify the heart rate analysis function to use history
 pub fn analyze_heart_rate_fft(
     signal: &[f32],
     sample_rate: f32,
@@ -346,6 +322,8 @@ pub fn analyze_heart_rate_fft(
     fft_context: &mut FftContext,
     time_step: f32,
 ) -> Option<f32> {
+    let quality = calculate_signal_quality(signal);
+
     // Check both trend and physiological plausibility
     if let Some(prev_hr) = prev_hr {
         // Check overall trend
@@ -359,127 +337,66 @@ pub fn analyze_heart_rate_fft(
         }
     }
 
-    // Get adaptive HR range and convert to frequencies
+    // If signal is too noisy and we have a previous value, return previous
+    if quality < 0.35 && prev_hr.is_some() {
+        return prev_hr;
+    }
+
+    // Use FFT context instead of creating new buffers
+    let buffer = fft_context.process(signal);
+
+    // Calculate frequency range
     let (min_hr, max_hr) = if let Some(prev_hr) = prev_hr {
         get_adaptive_hr_range(prev_hr, time_step)
     } else {
-        (40.0, 90.0) // Default range if no previous HR
+        (40.0, 100.0) // Default range if no previous HR
     };
 
-    let min_freq = bpm_to_hz(min_hr);
-    let max_freq = bpm_to_hz(max_hr);
-
-    // Process signal with bandpass filter and FFT
-    let buffer = fft_context.process(signal, sample_rate, min_freq, max_freq);
+    // Convert BPM to Hz
+    let min_freq = min_hr / 60.0;
+    let max_freq = max_hr / 60.0;
 
     // Calculate bin range for FFT
     let freq_resolution = sample_rate / signal.len() as f32;
     let min_bin = (min_freq / freq_resolution) as usize;
     let max_bin = (max_freq / freq_resolution) as usize;
 
-    // Find peaks in the heart rate range
+    // Find all peaks in the heart rate range
     let mut peaks = Vec::new();
-    let mut max_magnitude = 0.0f32;
-
-    // Calculate window duration in seconds
-    let window_duration = signal.len() as f32 / sample_rate;
-
-    // Adjust sigma based on window duration
-    // Start with 5 BPM for a 30-second window, scale linearly
-    let base_sigma = 5.0;
-    let sigma = base_sigma * (window_duration / 30.0).sqrt();
-
-    // First pass to find max magnitude
-    for bin in min_bin + 1..=max_bin - 1 {
-        let magnitude = (buffer[bin].norm_sqr() as f32).sqrt();
-        max_magnitude = max_magnitude.max(magnitude);
-    }
-
-    // Second pass to find significant peaks
     for bin in min_bin + 1..=max_bin - 1 {
         let magnitude = (buffer[bin].norm_sqr() as f32).sqrt();
         let prev_magnitude = (buffer[bin - 1].norm_sqr() as f32).sqrt();
         let next_magnitude = (buffer[bin + 1].norm_sqr() as f32).sqrt();
 
-        // Check if this is a local maximum and has significant magnitude
-        if magnitude > prev_magnitude
-            && magnitude > next_magnitude
-            && magnitude >= max_magnitude * 0.2
-        {
-            // Calculate peak sharpness metrics
-            let left_falloff = magnitude / prev_magnitude;
-            let right_falloff = magnitude / next_magnitude;
-            let falloff_sharpness = (left_falloff + right_falloff) / 2.0;
-
-            // Calculate second derivative (higher = sharper peak)
-            let second_derivative = (prev_magnitude - 2.0 * magnitude + next_magnitude).abs();
-            let normalized_second_deriv = second_derivative / magnitude; // Normalize to peak height
-
-            // Calculate peak symmetry using multiple points
-            let mut symmetry = 1.0;
-            if bin >= 2 && bin + 2 < buffer.len() {
-                // Get magnitudes for 2 points on each side
-                let left_profile = [
-                    buffer[bin - 2].norm_sqr().sqrt(),
-                    buffer[bin - 1].norm_sqr().sqrt(),
-                ];
-                let right_profile = [
-                    buffer[bin + 1].norm_sqr().sqrt(),
-                    buffer[bin + 2].norm_sqr().sqrt(),
-                ];
-
-                // Calculate relative differences from peak for each side
-                let left_diffs: Vec<f32> = left_profile
-                    .iter()
-                    .map(|&m| (magnitude - m) / magnitude)
-                    .collect();
-                let right_diffs: Vec<f32> = right_profile
-                    .iter()
-                    .map(|&m| (magnitude - m) / magnitude)
-                    .collect();
-
-                // Compare left and right profiles
-                let mut diff_sum = 0.0;
-                for i in 0..left_diffs.len() {
-                    diff_sum += (left_diffs[i] - right_diffs[i]).abs();
-                }
-                symmetry = 1.0 - (diff_sum / (2.0 * left_diffs.len() as f32));
-            }
-
-            // Combine metrics into a single peak quality score
-            let peak_quality = falloff_sharpness * 0.4 +    // How steep the peak is
-                             normalized_second_deriv * 0.2 + // How pointed the peak is
-                             symmetry * 0.4; // How symmetric the peak is
-
-            // Only consider peaks at least 20% of max
+        // Check if this is a local maximum
+        if magnitude > prev_magnitude && magnitude > next_magnitude {
             let freq = bin as f32 * freq_resolution;
-            let bpm = hz_to_bpm(freq);
-
-            // Apply Gaussian weighting if we have a previous HR
-            let weighted_magnitude = if let Some(prev_hr) = prev_hr {
-                let proximity_weight = (-0.5 * ((bpm - prev_hr) / sigma).powi(2)).exp();
-                magnitude * proximity_weight * peak_quality // Include peak quality in weighting
-            } else {
-                magnitude * peak_quality
-            };
-
-            peaks.push((bpm, magnitude, weighted_magnitude, peak_quality));
+            let bpm = freq * 60.0;
+            peaks.push((bpm, magnitude));
         }
     }
 
-    // Sort by weighted magnitude
-    peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Sort peaks by magnitude
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    // Take top peaks for consideration
-    let top_peaks: Vec<(f32, f32, f32, f32)> = peaks
-        .iter()
-        .take(7) // Consider top 7 peaks
-        .cloned()
-        .collect();
+    // If we have a previous heart rate, try to find a peak close to it
+    if let Some(prev_hr) = prev_hr {
+        let top_peaks: Vec<(f32, f32)> = peaks
+            .iter()
+            .take(7)
+            .filter(|(_bpm, magnitude)| *magnitude >= peaks[0].1 * 0.2)
+            .cloned()
+            .collect();
 
-    if let Some(&(bpm, magnitude, _, peak_quality)) = top_peaks.first() {
-        // Rest of validation logic remains the same
-        if let Some(prev_hr) = prev_hr {
+        if !top_peaks.is_empty() {
+            let best_peak = top_peaks
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+
+            let (bpm, magnitude) = *best_peak;
+
+            // After finding best peak but before applying it:
             // Check if the change is physiologically plausible
             let window_duration = if let Some((first_ts, _)) = history.rates.first() {
                 (timestamp - *first_ts).num_seconds() as f32
@@ -498,23 +415,18 @@ pub fn analyze_heart_rate_fft(
             }
 
             // Check if this change is suspicious
-            if is_suspicious_change(bpm, magnitude, max_magnitude, prev_hr) {
+            if is_suspicious_change(bpm, magnitude, peaks[0].1, prev_hr, quality) {
                 let maintained_hr = prev_hr;
                 history.add_measurement(timestamp, maintained_hr);
                 return Some(maintained_hr);
             }
 
-            // Calculate and apply confidence-based weighting with peak quality
+            // Calculate and apply confidence-based weighting
             let confidence = {
-                let normalized_magnitude = magnitude / max_magnitude;
+                let normalized_magnitude = magnitude / peaks[0].1;
                 let hr_change = (bpm - prev_hr).abs();
                 let change_penalty = (hr_change / 20.0).min(0.5);
-
-                // Incorporate peak quality into confidence
-                let quality_weight = 0.4; // How much to weight peak quality vs magnitude
-                let base_confidence =
-                    normalized_magnitude * (1.0 - quality_weight) + peak_quality * quality_weight;
-
+                let base_confidence = normalized_magnitude * quality;
                 (base_confidence - change_penalty).max(0.0)
             };
 
@@ -538,7 +450,7 @@ pub fn analyze_heart_rate_fft(
     // return the strongest peak if it's in valid range
     let result = peaks
         .first()
-        .map(|&(bpm, _, _, _)| bpm)
+        .map(|&(bpm, _)| bpm)
         .filter(|&bpm| bpm >= 40.0 && bpm <= 100.0);
 
     if let Some(bpm) = result {
@@ -560,12 +472,8 @@ pub fn analyze_breathing_rate_fft(
         return None;
     }
 
-    // For breathing rate, use fixed range of 8-20 BPM
-    let min_br = 8.0;
-    let max_br = 20.0;
-
-    // Use FFT context with sample rate parameter and breathing rate range
-    let buffer = fft_context.process(signal, sample_rate, min_br, max_br);
+    // Use FFT context instead of creating new buffers
+    let buffer = fft_context.process(signal);
 
     // Calculate frequency resolution
     let freq_resolution = sample_rate / signal.len() as f32;
@@ -692,6 +600,7 @@ fn is_physiologically_plausible(current_bpm: f32, prev_hr: f32, window_duration:
 pub struct SignalWindow {
     pub timestamp: DateTime<Utc>,
     pub processed_signal: Vec<f32>,
+    pub quality: f32,
 }
 
 /// Iterator that yields processed windows of signal data
@@ -745,12 +654,14 @@ impl<'a> Iterator for SignalWindowIterator<'a> {
 
         // Use the buffers to process the window
         let processed_signal = self.buffers.process_window(segment).to_vec();
+        let quality = calculate_signal_quality(&processed_signal);
 
         self.current_idx += self.step_size;
 
         Some(SignalWindow {
             timestamp,
             processed_signal,
+            quality,
         })
     }
 }
