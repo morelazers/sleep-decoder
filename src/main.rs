@@ -11,6 +11,11 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
+mod heart_analysis;
+mod phase_analysis;
+
+use phase_analysis::SleepPhase;
+
 /// Process sleep data from RAW files
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -609,7 +614,75 @@ fn extract_raw_data_for_period<'a>(
     create_raw_data_view(raw_sensor_data, period)
 }
 
-mod heart_analysis;
+fn calculate_time_weight(sleep_onset: DateTime<Utc>, current_time: DateTime<Utc>) -> f32 {
+    let minutes_since_onset = (current_time - sleep_onset).num_minutes() as f32;
+
+    // Time windows for different sleep stages (in minutes)
+    const EARLY_SLEEP: f32 = 90.0; // First 90 minutes
+    const DEEP_SLEEP_PEAK: f32 = 180.0; // Around 3 hours
+    const LATE_SLEEP: f32 = 360.0; // After 6 hours
+
+    if minutes_since_onset < EARLY_SLEEP {
+        // Weight increases linearly in first 90 minutes
+        1.0 + (minutes_since_onset / EARLY_SLEEP)
+    } else if minutes_since_onset < DEEP_SLEEP_PEAK {
+        // Peak deep sleep period
+        2.0
+    } else if minutes_since_onset < LATE_SLEEP {
+        // Gradually decrease weight after peak
+        2.0 * (1.0 - ((minutes_since_onset - DEEP_SLEEP_PEAK) / (LATE_SLEEP - DEEP_SLEEP_PEAK)))
+    } else {
+        // Minimum weight in late sleep
+        0.5
+    }
+}
+
+fn detect_sleep_onset(analysis: &PeriodAnalysis, window_minutes: i64) -> Option<DateTime<Utc>> {
+    if analysis.breathing_rates.is_empty() {
+        return None;
+    }
+
+    // Convert window to number of samples (assuming ~1 measurement per minute)
+    let window_size = window_minutes as usize;
+    let stability_threshold = 2.5; // breathing rate variance threshold
+    let required_consecutive_stable = 5; // number of consecutive stable windows required
+    let outlier_windows_permitted = 2;
+
+    let mut consecutive_stable = 0;
+    let mut potential_onset = None;
+    let mut outlier_windows = 0;
+
+    // Analyze sliding windows
+    for window in analysis.breathing_rates.windows(window_size) {
+        // Calculate variance of breathing rates in this window
+        let mean = window.iter().map(|(_, rate)| rate).sum::<f32>() / window.len() as f32;
+        let variance = window
+            .iter()
+            .map(|(_, rate)| {
+                let diff = rate - mean;
+                diff * diff
+            })
+            .sum::<f32>()
+            / window.len() as f32;
+
+        if variance < stability_threshold {
+            consecutive_stable += 1;
+            if consecutive_stable == 1 {
+                potential_onset = Some(window[0].0);
+            }
+            if consecutive_stable >= required_consecutive_stable {
+                return potential_onset;
+            }
+        } else if outlier_windows < outlier_windows_permitted {
+            outlier_windows += 1;
+        } else {
+            consecutive_stable = 0;
+            potential_onset = None;
+        }
+    }
+
+    None
+}
 
 fn analyse_sensor_data(
     signal: &[i32],
@@ -898,6 +971,7 @@ fn write_analysis_to_csv(
     sensor_id: &str,
     period_num: usize,
     analysis: &PeriodAnalysis,
+    sleep_phases: &[(DateTime<Utc>, SleepPhase)],
     hr_smoothing_window: usize,
 ) -> anyhow::Result<()> {
     let path = std::path::Path::new(base_path);
@@ -930,7 +1004,13 @@ fn write_analysis_to_csv(
     );
 
     // Write header
-    writer.write_record(&["timestamp", "fft_hr", "fft_hr_smoothed", "breathing_rate"])?;
+    writer.write_record(&[
+        "timestamp",
+        "fft_hr",
+        "fft_hr_smoothed",
+        "breathing_rate",
+        "sleep_phase",
+    ])?;
 
     // Write data for each timestamp
     for &timestamp in &timestamps {
@@ -954,11 +1034,18 @@ fn write_analysis_to_csv(
             .map(|(_, br)| br.to_string())
             .unwrap_or_default();
 
+        let sleep_phase = sleep_phases
+            .iter()
+            .find(|(t, _)| *t == timestamp)
+            .map(|(_, phase)| format!("{:?}", phase))
+            .unwrap_or_default();
+
         writer.write_record(&[
             timestamp.format("%Y-%m-%d %H:%M").to_string(),
             fft_hr,
             fft_hr_smoothed,
             br,
+            sleep_phase,
         ])?;
     }
 
@@ -1108,6 +1195,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write CSV files if output prefix was provided
     if let Some(prefix) = &args.csv_output {
         for analysis in &bed_analysis.left_side {
+            // Analyze sleep phases for this period
+            let sleep_phases = phase_analysis::analyze_sleep_phases(
+                &analysis.combined,
+                left_periods[analysis.period_num].start,
+            );
+
             if let Some(split_sensors) = &args.split_sensors {
                 if *split_sensors == true {
                     write_analysis_to_csv(
@@ -1115,6 +1208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "left",
                         analysis.period_num,
                         &analysis.sensor1,
+                        &sleep_phases,
                         hr_smoothing_window,
                     )?;
                     write_analysis_to_csv(
@@ -1122,6 +1216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "left2",
                         analysis.period_num,
                         &analysis.sensor2,
+                        &sleep_phases,
                         hr_smoothing_window,
                     )?;
                 }
@@ -1131,11 +1226,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "left_combined",
                 analysis.period_num,
                 &analysis.combined,
+                &sleep_phases,
                 hr_smoothing_window,
             )?;
         }
 
         for analysis in &bed_analysis.right_side {
+            // Analyze sleep phases for this period
+            let sleep_phases = phase_analysis::analyze_sleep_phases(
+                &analysis.combined,
+                right_periods[analysis.period_num].start,
+            );
+
             if let Some(split_sensors) = &args.split_sensors {
                 if *split_sensors == true {
                     write_analysis_to_csv(
@@ -1143,6 +1245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "right",
                         analysis.period_num,
                         &analysis.sensor1,
+                        &sleep_phases,
                         hr_smoothing_window,
                     )?;
                     write_analysis_to_csv(
@@ -1150,6 +1253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "right2",
                         analysis.period_num,
                         &analysis.sensor2,
+                        &sleep_phases,
                         hr_smoothing_window,
                     )?;
                 }
@@ -1159,6 +1263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "right_combined",
                 analysis.period_num,
                 &analysis.combined,
+                &sleep_phases,
                 hr_smoothing_window,
             )?;
         }
