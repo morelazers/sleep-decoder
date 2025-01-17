@@ -312,7 +312,7 @@ impl FftContext {
     }
 }
 
-/// Modify the heart rate analysis function to use history
+/// Modify the heart rate analysis function to use breathing rate data
 pub fn analyze_heart_rate_fft(
     signal: &[f32],
     sample_rate: f32,
@@ -321,6 +321,7 @@ pub fn analyze_heart_rate_fft(
     history: &mut HeartRateHistory,
     fft_context: &mut FftContext,
     time_step: f32,
+    breathing_rate: Option<f32>,
 ) -> Option<f32> {
     let quality = calculate_signal_quality(signal);
 
@@ -361,6 +362,16 @@ pub fn analyze_heart_rate_fft(
     let min_bin = (min_freq / freq_resolution) as usize;
     let max_bin = (max_freq / freq_resolution) as usize;
 
+    // Calculate breathing harmonics if available
+    let harmonic_freqs = breathing_rate.map(|br| {
+        let fundamental = br / 60.0; // Convert BPM to Hz
+        vec![
+            fundamental * 2.0, // Second harmonic
+            fundamental * 3.0, // Third harmonic
+            fundamental * 4.0, // Fourth harmonic
+        ]
+    });
+
     // Find all peaks in the heart rate range
     let mut peaks = Vec::new();
     for bin in min_bin + 1..=max_bin - 1 {
@@ -372,11 +383,40 @@ pub fn analyze_heart_rate_fft(
         if magnitude > prev_magnitude && magnitude > next_magnitude {
             let freq = bin as f32 * freq_resolution;
             let bpm = freq * 60.0;
-            peaks.push((bpm, magnitude));
+
+            // Check if this peak is near a breathing harmonic
+            let harmonic_factor = if let Some(harmonics) = &harmonic_freqs {
+                let is_harmonic = harmonics.iter().any(|&h| (freq - h).abs() < 0.05);
+                if is_harmonic {
+                    // If we have a previous heart rate, check if this peak is close to it
+                    if let Some(prev_hr) = prev_hr {
+                        let freq_diff = (bpm - prev_hr).abs();
+                        if freq_diff < 5.0 {
+                            // If very close to previous HR, don't penalize
+                            1.0
+                        } else if freq_diff < 10.0 {
+                            // If somewhat close, apply mild penalty
+                            0.8
+                        } else {
+                            // If far from previous HR, likely a harmonic
+                            0.5
+                        }
+                    } else {
+                        // No previous HR to validate against
+                        0.5
+                    }
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+
+            peaks.push((bpm, magnitude * harmonic_factor));
         }
     }
 
-    // Sort peaks by magnitude
+    // Sort peaks by adjusted magnitude
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
     // If we have a previous heart rate, try to find a peak close to it

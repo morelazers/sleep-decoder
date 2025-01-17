@@ -628,6 +628,26 @@ fn analyse_sensor_data(
     let mut br_fft_context = heart_analysis::FftContext::new(samples_per_segment_br);
     let mut hr_history = heart_analysis::HeartRateHistory::new(15.0 * 60.0);
 
+    // Process breathing rate windows first...
+    let br_windows = heart_analysis::SignalWindowIterator::new(
+        signal,
+        raw_data,
+        samples_per_segment_br,
+        step_size_br,
+        500.0,
+    );
+
+    // Collect breathing rates with timestamps
+    for window in br_windows {
+        if let Some(breathing_rate) = heart_analysis::analyze_breathing_rate_fft(
+            &window.processed_signal,
+            500.0,
+            &mut br_fft_context,
+        ) {
+            breathing_rates.push((window.timestamp, breathing_rate));
+        }
+    }
+
     // Process heart rate windows...
     let hr_windows = heart_analysis::SignalWindowIterator::new(
         signal,
@@ -640,6 +660,14 @@ fn analyse_sensor_data(
     let time_step = samples_per_segment_hr as f32 / 500.0;
 
     for window in hr_windows {
+        // Find the closest breathing rate measurement
+        let breathing_rate = breathing_rates
+            .iter()
+            .min_by_key(|(br_time, _)| {
+                (br_time.timestamp() - window.timestamp.timestamp()).abs() as u64
+            })
+            .map(|(_, rate)| *rate);
+
         if let Some(fft_hr) = heart_analysis::analyze_heart_rate_fft(
             &window.processed_signal,
             500.0,
@@ -648,28 +676,10 @@ fn analyse_sensor_data(
             &mut hr_history,
             &mut hr_fft_context,
             time_step,
+            breathing_rate,
         ) {
             fft_heart_rates.push((window.timestamp, fft_hr));
             prev_fft_hr = Some(fft_hr);
-        }
-    }
-
-    // Process breathing rate windows...
-    let br_windows = heart_analysis::SignalWindowIterator::new(
-        signal,
-        raw_data,
-        samples_per_segment_br,
-        step_size_br,
-        500.0,
-    );
-
-    for window in br_windows {
-        if let Some(breathing_rate) = heart_analysis::analyze_breathing_rate_fft(
-            &window.processed_signal,
-            500.0,
-            &mut br_fft_context, // Pass the breathing rate FFT context
-        ) {
-            breathing_rates.push((window.timestamp, breathing_rate));
         }
     }
 
