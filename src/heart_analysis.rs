@@ -545,7 +545,7 @@ pub fn analyze_heart_rate_fft(
             }
 
             // Check if this is an outlier compared to recent history
-            let recent_rates = history.get_recent_rates(180);
+            let recent_rates = history.get_recent_rates(60);
             let is_valid = if !recent_rates.is_empty() {
                 let mut sorted_rates = recent_rates;
                 sorted_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
