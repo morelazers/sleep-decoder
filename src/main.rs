@@ -726,14 +726,11 @@ fn analyze_bed_presence_periods(
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
         // Extract signals from both sensors
-        let signal1: Vec<i32> = (0..raw_data_view.len())
+        let combined_signal: Vec<i32> = (0..raw_data_view.len())
             .filter_map(|idx| raw_data_view.get_data_at(idx))
             .map(|data| data.left.to_vec())
             .flatten()
             .collect();
-
-        // Combine signals by averaging
-        let combined_signal = signal1;
 
         let analysis_combined = analyse_sensor_data(
             &combined_signal,
@@ -767,14 +764,11 @@ fn analyze_bed_presence_periods(
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
         // Extract signals from both sensors
-        let signal1: Vec<i32> = (0..raw_data_view.len())
+        let combined_signal: Vec<i32> = (0..raw_data_view.len())
             .filter_map(|idx| raw_data_view.get_data_at(idx))
             .map(|data| data.right.to_vec()) // Use right side data
             .flatten()
             .collect();
-
-        // Combine signals by averaging
-        let combined_signal = signal1;
 
         let analysis_combined = analyse_sensor_data(
             &combined_signal,
