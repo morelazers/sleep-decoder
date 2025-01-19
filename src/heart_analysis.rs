@@ -1,9 +1,207 @@
 use super::RawDataView;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use log::debug;
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use sci_rs::signal::filter::{design::Sos, sosfiltfilt_dyn};
 use std::f32::consts::PI;
+use std::sync::Arc;
+
+/// A window of signal data with its metadata
+pub struct SignalWindow {
+    pub timestamp: DateTime<Utc>,
+    pub processed_signal: Vec<f32>,
+}
+
+/// Iterator that yields processed windows of signal data
+pub struct SignalWindowIterator<'a> {
+    signal: &'a [i32],
+    raw_data: &'a RawDataView<'a>,
+    window_size: usize,
+    step_size: usize,
+    current_idx: usize,
+    buffers: SignalProcessingBuffers,
+}
+
+impl<'a> SignalWindowIterator<'a> {
+    pub fn new(
+        signal: &'a [i32],
+        raw_data: &'a RawDataView<'a>,
+        window_size: usize,
+        step_size: usize,
+    ) -> Self {
+        Self {
+            signal,
+            raw_data,
+            window_size,
+            step_size,
+            current_idx: 0,
+            buffers: SignalProcessingBuffers::new(window_size),
+        }
+    }
+}
+
+impl<'a> Iterator for SignalWindowIterator<'a> {
+    type Item = SignalWindow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_idx >= self.signal.len() {
+            return None;
+        }
+
+        let end_idx = (self.current_idx + self.window_size).min(self.signal.len());
+
+        // Skip if window is too small
+        if end_idx - self.current_idx < self.window_size / 2 {
+            return None;
+        }
+
+        let segment = &self.signal[self.current_idx..end_idx];
+        let timestamp = self.raw_data.get_data_at(self.current_idx / 500)?.timestamp;
+
+        // Use the buffers to process the window
+        let processed_signal = self.buffers.process_window(segment).to_vec();
+
+        self.current_idx += self.step_size;
+
+        Some(SignalWindow {
+            timestamp,
+            processed_signal,
+        })
+    }
+}
+
+pub struct SignalProcessingBuffers {
+    cleaned: Vec<f32>,
+    float_buffer: Vec<f32>,
+    scaled: Vec<f32>,
+    processed: Vec<f32>,
+}
+
+impl SignalProcessingBuffers {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cleaned: Vec::with_capacity(capacity),
+            float_buffer: Vec::with_capacity(capacity),
+            scaled: Vec::with_capacity(capacity),
+            processed: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn process_window(&mut self, segment: &[i32]) -> &[f32] {
+        // Reuse buffers instead of creating new ones
+        self.cleaned.clear();
+        self.float_buffer.clear();
+        self.scaled.clear();
+        self.processed.clear();
+
+        interpolate_outliers_into(segment, 2, &mut self.cleaned);
+        convert_to_f32(&self.cleaned, &mut self.float_buffer);
+        scale_data_into(&self.float_buffer, 0.0, 1024.0, &mut self.scaled);
+        remove_baseline_wander_into(&self.scaled, 500.0, 0.05, &mut self.processed);
+
+        &self.processed
+    }
+}
+
+/// Store historical heart rate data
+pub struct HeartRateHistory {
+    rates: Vec<(DateTime<Utc>, f32)>, // (timestamp, heart_rate)
+    window_duration: f32,             // Duration to look back in seconds
+}
+
+impl HeartRateHistory {
+    pub fn new(window_duration: f32) -> Self {
+        Self {
+            rates: Vec::new(),
+            window_duration,
+        }
+    }
+
+    pub fn add_measurement(&mut self, timestamp: DateTime<Utc>, rate: f32) {
+        self.rates.push((timestamp, rate));
+
+        // Remove old measurements
+        let cutoff = timestamp - Duration::seconds(self.window_duration as i64);
+        self.rates.retain(|(ts, _)| *ts >= cutoff);
+    }
+
+    pub fn get_trend(&self) -> Option<f32> {
+        if self.rates.len() < 2 {
+            return None;
+        }
+
+        // Calculate rate of change in BPM per minute
+        let (first_ts, first_rate) = self.rates.first()?;
+        let (last_ts, last_rate) = self.rates.last()?;
+
+        let duration_mins = (*last_ts - first_ts).num_seconds() as f32 / 60.0;
+        if duration_mins < 1.0 {
+            return None;
+        }
+
+        Some((last_rate - first_rate) / duration_mins)
+    }
+}
+
+/// FFT context holding reusable buffers and planner
+pub struct FftContext {
+    window: Vec<f32>,
+    windowed_signal: Vec<f32>,
+    complex_buffer: Vec<Complex<f32>>,
+    fft: Arc<dyn Fft<f32>>,
+    buffer_size: usize,
+}
+
+impl FftContext {
+    pub fn new(size: usize) -> Self {
+        // Create Hann window once
+        let window = create_hann_window(size);
+
+        // Pre-allocate buffers
+        let windowed_signal = Vec::with_capacity(size);
+        let complex_buffer = Vec::with_capacity(size);
+
+        // Create FFT planner once
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(size);
+
+        Self {
+            window,
+            windowed_signal,
+            complex_buffer,
+            fft,
+            buffer_size: size,
+        }
+    }
+
+    fn process(&mut self, signal: &[f32]) -> &[Complex<f32>] {
+        // Pad or truncate signal to match buffer size
+        self.windowed_signal.clear();
+        if signal.len() <= self.buffer_size {
+            // Pad with zeros
+            self.windowed_signal
+                .extend(signal.iter().zip(self.window.iter()).map(|(&s, &w)| s * w));
+            self.windowed_signal.resize(self.buffer_size, 0.0);
+        } else {
+            // Truncate
+            self.windowed_signal.extend(
+                signal[..self.buffer_size]
+                    .iter()
+                    .zip(self.window.iter())
+                    .map(|(&s, &w)| s * w),
+            );
+        }
+
+        // Rest of processing remains the same...
+        self.complex_buffer.clear();
+        self.complex_buffer
+            .extend(self.windowed_signal.iter().map(|&x| Complex::new(x, 0.0)));
+
+        self.fft.process(&mut self.complex_buffer);
+
+        &self.complex_buffer
+    }
+}
 
 /// Create a Hann window of the specified size
 fn create_hann_window(size: usize) -> Vec<f32> {
@@ -171,144 +369,62 @@ fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
     (min_hr, max_hr)
 }
 
-/// Calculate signal quality metric
-fn calculate_signal_quality(signal: &[f32]) -> f32 {
-    // Calculate signal variance
-    let mean = signal.iter().sum::<f32>() / signal.len() as f32;
-    let variance = signal.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / signal.len() as f32;
-
-    // Calculate zero crossings
-    let zero_crossings = signal
-        .windows(2)
-        .filter(|w| w[0].signum() != w[1].signum())
-        .count();
-
-    // Combine metrics (lower score = noisier signal)
-    let quality_score = 1.0 / (1.0 + variance * (zero_crossings as f32 / signal.len() as f32));
-
-    quality_score
-}
-
 /// Detect if a heart rate change is suspicious based on multiple criteria
-fn is_suspicious_change(
-    bpm: f32,
-    magnitude: f32,
-    max_magnitude: f32,
-    prev_hr: f32,
-    quality: f32,
-) -> bool {
+fn is_suspicious_change(bpm: f32, magnitude: f32, max_magnitude: f32, prev_hr: f32) -> bool {
     let hr_change = (bpm - prev_hr).abs();
     let normalized_magnitude = magnitude / max_magnitude;
 
     // Criteria for suspicious changes:
     // 1. Large change with weak peak
-    // 2. Change size relative to signal quality
-    // 3. Magnitude threshold increases with larger changes
+    // 2. Magnitude threshold increases with larger changes
 
     let required_magnitude = 0.3 + (hr_change / 20.0).min(0.3); // Higher threshold for bigger changes
 
     (hr_change > 8.0 && normalized_magnitude < required_magnitude)
-        || (hr_change > 12.0 && quality < 0.4)
         || (hr_change > 15.0 && normalized_magnitude < 0.6)
 }
 
-/// Store historical heart rate data
-pub struct HeartRateHistory {
-    rates: Vec<(DateTime<Utc>, f32)>, // (timestamp, heart_rate)
-    window_duration: f32,             // Duration to look back in seconds
-}
+/// Calculate the harmonic penalty factor for a given frequency
+fn calculate_harmonic_penalty(
+    freq: f32,
+    bpm: f32,
+    breathing_data: Option<(f32, f32)>,
+    prev_hr: Option<f32>,
+) -> f32 {
+    if let Some((br, stability)) = breathing_data {
+        // Calculate breathing harmonics
+        let fundamental = br / 60.0; // Convert BPM to Hz
+        let harmonics = vec![
+            fundamental * 2.0, // Second harmonic
+            fundamental * 3.0, // Third harmonic
+            fundamental * 4.0, // Fourth harmonic
+        ];
 
-impl HeartRateHistory {
-    pub fn new(window_duration: f32) -> Self {
-        Self {
-            rates: Vec::new(),
-            window_duration,
-        }
-    }
-
-    pub fn add_measurement(&mut self, timestamp: DateTime<Utc>, rate: f32) {
-        self.rates.push((timestamp, rate));
-
-        // Remove old measurements
-        let cutoff = timestamp - chrono::Duration::seconds(self.window_duration as i64);
-        self.rates.retain(|(ts, _)| *ts >= cutoff);
-    }
-
-    pub fn get_trend(&self) -> Option<f32> {
-        if self.rates.len() < 2 {
-            return None;
-        }
-
-        // Calculate rate of change in BPM per minute
-        let (first_ts, first_rate) = self.rates.first()?;
-        let (last_ts, last_rate) = self.rates.last()?;
-
-        let duration_mins = (*last_ts - first_ts).num_seconds() as f32 / 60.0;
-        if duration_mins < 1.0 {
-            return None;
-        }
-
-        Some((last_rate - first_rate) / duration_mins)
-    }
-}
-
-/// FFT context holding reusable buffers and planner
-pub struct FftContext {
-    window: Vec<f32>,
-    windowed_signal: Vec<f32>,
-    complex_buffer: Vec<Complex<f32>>,
-    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
-    buffer_size: usize,
-}
-
-impl FftContext {
-    pub fn new(size: usize) -> Self {
-        // Create Hann window once
-        let window = create_hann_window(size);
-
-        // Pre-allocate buffers
-        let windowed_signal = Vec::with_capacity(size);
-        let complex_buffer = Vec::with_capacity(size);
-
-        // Create FFT planner once
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(size);
-
-        Self {
-            window,
-            windowed_signal,
-            complex_buffer,
-            fft,
-            buffer_size: size,
-        }
-    }
-
-    fn process(&mut self, signal: &[f32]) -> &[Complex<f32>] {
-        // Pad or truncate signal to match buffer size
-        self.windowed_signal.clear();
-        if signal.len() <= self.buffer_size {
-            // Pad with zeros
-            self.windowed_signal
-                .extend(signal.iter().zip(self.window.iter()).map(|(&s, &w)| s * w));
-            self.windowed_signal.resize(self.buffer_size, 0.0);
+        // Check if frequency is near a harmonic
+        let is_harmonic = harmonics.iter().any(|&h| (freq - h).abs() < 0.05);
+        if is_harmonic {
+            // If we have a previous heart rate, check if this peak is close to it
+            if let Some(prev_hr) = prev_hr {
+                let freq_diff = (bpm - prev_hr).abs();
+                if freq_diff < 5.0 {
+                    // If very close to previous HR, don't penalize
+                    1.0
+                } else {
+                    // Scale penalty by breathing stability
+                    // High stability (1.0) -> full penalty
+                    // Low stability (0.0) -> minimal penalty
+                    let base_penalty = if freq_diff < 10.0 { 0.8 } else { 0.5 };
+                    1.0 - (1.0 - base_penalty) * stability
+                }
+            } else {
+                // No previous HR, scale penalty by stability
+                1.0 - (0.5 * stability)
+            }
         } else {
-            // Truncate
-            self.windowed_signal.extend(
-                signal[..self.buffer_size]
-                    .iter()
-                    .zip(self.window.iter())
-                    .map(|(&s, &w)| s * w),
-            );
+            1.0
         }
-
-        // Rest of processing remains the same...
-        self.complex_buffer.clear();
-        self.complex_buffer
-            .extend(self.windowed_signal.iter().map(|&x| Complex::new(x, 0.0)));
-
-        self.fft.process(&mut self.complex_buffer);
-
-        &self.complex_buffer
+    } else {
+        1.0
     }
 }
 
@@ -323,8 +439,6 @@ pub fn analyze_heart_rate_fft(
     time_step: f32,
     breathing_data: Option<(f32, f32)>, // (rate, stability)
 ) -> Option<f32> {
-    let quality = calculate_signal_quality(signal);
-
     // Check both trend and physiological plausibility
     if let Some(prev_hr) = prev_hr {
         // Check overall trend
@@ -338,11 +452,6 @@ pub fn analyze_heart_rate_fft(
         }
     }
 
-    // If signal is too noisy and we have a previous value, return previous
-    if quality < 0.35 && prev_hr.is_some() {
-        return prev_hr;
-    }
-
     // Use FFT context instead of creating new buffers
     let buffer = fft_context.process(signal);
 
@@ -350,7 +459,7 @@ pub fn analyze_heart_rate_fft(
     let (min_hr, max_hr) = if let Some(prev_hr) = prev_hr {
         get_adaptive_hr_range(prev_hr, time_step)
     } else {
-        (40.0, 100.0) // Default range if no previous HR
+        (40.0, 90.0) // Default range if no previous HR
     };
 
     // Convert BPM to Hz
@@ -361,16 +470,6 @@ pub fn analyze_heart_rate_fft(
     let freq_resolution = sample_rate / signal.len() as f32;
     let min_bin = (min_freq / freq_resolution) as usize;
     let max_bin = (max_freq / freq_resolution) as usize;
-
-    // Calculate breathing harmonics if available
-    let harmonic_freqs = breathing_data.map(|(br, _)| {
-        let fundamental = br / 60.0; // Convert BPM to Hz
-        vec![
-            fundamental * 2.0, // Second harmonic
-            fundamental * 3.0, // Third harmonic
-            fundamental * 4.0, // Fourth harmonic
-        ]
-    });
 
     // Find all peaks in the heart rate range
     let mut peaks = Vec::new();
@@ -384,37 +483,8 @@ pub fn analyze_heart_rate_fft(
             let freq = bin as f32 * freq_resolution;
             let bpm = freq * 60.0;
 
-            // Check if this peak is near a breathing harmonic
-            let harmonic_factor = if let Some((_, stability)) = breathing_data {
-                if let Some(harmonics) = &harmonic_freqs {
-                    let is_harmonic = harmonics.iter().any(|&h| (freq - h).abs() < 0.05);
-                    if is_harmonic {
-                        // If we have a previous heart rate, check if this peak is close to it
-                        if let Some(prev_hr) = prev_hr {
-                            let freq_diff = (bpm - prev_hr).abs();
-                            if freq_diff < 5.0 {
-                                // If very close to previous HR, don't penalize
-                                1.0
-                            } else {
-                                // Scale penalty by breathing stability
-                                // High stability (1.0) -> full penalty
-                                // Low stability (0.0) -> minimal penalty
-                                let base_penalty = if freq_diff < 10.0 { 0.8 } else { 0.5 };
-                                1.0 - (1.0 - base_penalty) * stability
-                            }
-                        } else {
-                            // No previous HR, scale penalty by stability
-                            1.0 - (0.5 * stability)
-                        }
-                    } else {
-                        1.0
-                    }
-                } else {
-                    1.0
-                }
-            } else {
-                1.0
-            };
+            // Calculate harmonic penalty
+            let harmonic_factor = calculate_harmonic_penalty(freq, bpm, breathing_data, prev_hr);
 
             peaks.push((bpm, magnitude * harmonic_factor));
         }
@@ -459,7 +529,7 @@ pub fn analyze_heart_rate_fft(
             }
 
             // Check if this change is suspicious
-            if is_suspicious_change(bpm, magnitude, peaks[0].1, prev_hr, quality) {
+            if is_suspicious_change(bpm, magnitude, peaks[0].1, prev_hr) {
                 let maintained_hr = prev_hr;
                 history.add_measurement(timestamp, maintained_hr);
                 return Some(maintained_hr);
@@ -470,8 +540,7 @@ pub fn analyze_heart_rate_fft(
                 let normalized_magnitude = magnitude / peaks[0].1;
                 let hr_change = (bpm - prev_hr).abs();
                 let change_penalty = (hr_change / 20.0).min(0.5);
-                let base_confidence = normalized_magnitude * quality;
-                (base_confidence - change_penalty).max(0.0)
+                (normalized_magnitude - change_penalty).max(0.0)
             };
 
             let smoothed_bpm = if confidence >= 0.8 {
@@ -638,109 +707,6 @@ fn is_physiologically_plausible(current_bpm: f32, prev_hr: f32, window_duration:
     let hr_change = current_bpm - prev_hr;
     let rate_of_change = hr_change / (window_duration / 60.0); // Convert to per minute
     validate_rate_of_change(rate_of_change, hr_change < 0.0)
-}
-
-/// A window of signal data with its metadata
-pub struct SignalWindow {
-    pub timestamp: DateTime<Utc>,
-    pub processed_signal: Vec<f32>,
-    pub quality: f32,
-}
-
-/// Iterator that yields processed windows of signal data
-pub struct SignalWindowIterator<'a> {
-    signal: &'a [i32],
-    raw_data: &'a RawDataView<'a>,
-    window_size: usize,
-    step_size: usize,
-    current_idx: usize,
-    sample_rate: f32,
-    buffers: SignalProcessingBuffers,
-}
-
-impl<'a> SignalWindowIterator<'a> {
-    pub fn new(
-        signal: &'a [i32],
-        raw_data: &'a RawDataView<'a>,
-        window_size: usize,
-        step_size: usize,
-        sample_rate: f32,
-    ) -> Self {
-        Self {
-            signal,
-            raw_data,
-            window_size,
-            step_size,
-            current_idx: 0,
-            sample_rate,
-            buffers: SignalProcessingBuffers::new(window_size),
-        }
-    }
-}
-
-impl<'a> Iterator for SignalWindowIterator<'a> {
-    type Item = SignalWindow;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_idx >= self.signal.len() {
-            return None;
-        }
-
-        let end_idx = (self.current_idx + self.window_size).min(self.signal.len());
-
-        // Skip if window is too small
-        if end_idx - self.current_idx < self.window_size / 2 {
-            return None;
-        }
-
-        let segment = &self.signal[self.current_idx..end_idx];
-        let timestamp = self.raw_data.get_data_at(self.current_idx / 500)?.timestamp;
-
-        // Use the buffers to process the window
-        let processed_signal = self.buffers.process_window(segment).to_vec();
-        let quality = calculate_signal_quality(&processed_signal);
-
-        self.current_idx += self.step_size;
-
-        Some(SignalWindow {
-            timestamp,
-            processed_signal,
-            quality,
-        })
-    }
-}
-
-pub struct SignalProcessingBuffers {
-    cleaned: Vec<f32>,
-    float_buffer: Vec<f32>,
-    scaled: Vec<f32>,
-    processed: Vec<f32>,
-}
-
-impl SignalProcessingBuffers {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            cleaned: Vec::with_capacity(capacity),
-            float_buffer: Vec::with_capacity(capacity),
-            scaled: Vec::with_capacity(capacity),
-            processed: Vec::with_capacity(capacity),
-        }
-    }
-
-    pub fn process_window(&mut self, segment: &[i32]) -> &[f32] {
-        // Reuse buffers instead of creating new ones
-        self.cleaned.clear();
-        self.float_buffer.clear();
-        self.scaled.clear();
-        self.processed.clear();
-
-        interpolate_outliers_into(segment, 2, &mut self.cleaned);
-        convert_to_f32(&self.cleaned, &mut self.float_buffer);
-        scale_data_into(&self.float_buffer, 0.0, 1024.0, &mut self.scaled);
-        remove_baseline_wander_into(&self.scaled, 500.0, 0.05, &mut self.processed);
-
-        &self.processed
-    }
 }
 
 fn interpolate_outliers_into(data: &[i32], i: i32, output: &mut Vec<f32>) {

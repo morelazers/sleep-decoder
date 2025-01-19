@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -7,6 +7,7 @@ use log::trace;
 use serde::{Deserialize, Serialize};
 use serde_bytes;
 use std::env;
+use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -47,16 +48,18 @@ struct BatchItem {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BedTempSide {
-    _side: f32,
-    _out: f32,
-    _cen: f32,
+    side: f32,
+    out: f32,
+    cen: f32,
     #[serde(rename = "in")]
     _in: f32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 enum SensorData {
     #[serde(rename = "piezo-dual")]
     PiezoDual {
@@ -75,11 +78,11 @@ enum SensorData {
     },
     #[serde(rename = "bedTemp")]
     BedTemp {
-        _ts: i64,
-        _mcu: f32,
-        _amb: f32,
-        _left: BedTempSide,
-        _right: BedTempSide,
+        ts: i64,
+        mcu: f32,
+        amb: f32,
+        left: BedTempSide,
+        right: BedTempSide,
     },
 }
 
@@ -367,7 +370,7 @@ fn remove_time_outliers(data: &mut Vec<ProcessedData>) {
     println!("Remaining rows: {}", data.len());
 }
 
-fn decode_batch_item(file_path: &PathBuf) -> anyhow::Result<Vec<(u32, SensorData)>> {
+fn decode_batch_item(file_path: &PathBuf) -> Result<Vec<(u32, SensorData)>> {
     let file = File::open(file_path)
         .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
     let mut reader = BufReader::new(file);
@@ -634,7 +637,6 @@ fn analyse_sensor_data(
         raw_data,
         samples_per_segment_br,
         step_size_br,
-        500.0,
     );
 
     // Collect breathing rates
@@ -677,7 +679,6 @@ fn analyse_sensor_data(
         raw_data,
         samples_per_segment_hr,
         step_size_hr,
-        500.0,
     );
 
     let time_step = samples_per_segment_hr as f32 / 500.0;
@@ -716,7 +717,7 @@ fn analyze_bed_presence_periods(
     raw_sensor_data: &[(u32, SensorData)],
     left_periods: &[BedPresence],
     right_periods: &[BedPresence],
-) -> anyhow::Result<BedAnalysis> {
+) -> Result<BedAnalysis> {
     let mut bed_analysis = BedAnalysis {
         left_side: Vec::new(),
         right_side: Vec::new(),
@@ -932,7 +933,7 @@ fn write_analysis_to_csv(
     period_num: usize,
     analysis: &PeriodAnalysis,
     hr_smoothing_window: usize,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let path = std::path::Path::new(base_path);
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let stem = path
@@ -999,12 +1000,12 @@ fn write_analysis_to_csv(
     Ok(())
 }
 
-fn parse_datetime(datetime_str: &str) -> anyhow::Result<DateTime<Utc>> {
+fn parse_datetime(datetime_str: &str) -> Result<DateTime<Utc>> {
     let naive = NaiveDateTime::parse_from_str(datetime_str, "%Y-%m-%d %H:%M")?;
     Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logger
     env_logger::init();
 
