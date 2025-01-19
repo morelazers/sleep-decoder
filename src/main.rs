@@ -3,10 +3,8 @@ use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use env_logger;
-use log::trace;
 use serde::{Deserialize, Serialize};
 use serde_bytes;
-use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
@@ -33,12 +31,24 @@ struct Args {
     csv_output: Option<String>,
 
     /// Window size for smoothing HR results
-    #[arg(long, env = "HR_SMOOTHING_WINDOW", default_value = "60")]
-    hr_smoothing_window: Option<usize>,
+    #[arg(long, default_value = "60")]
+    hr_smoothing_window: usize,
 
-    /// Split sensors into separate CSV files
-    #[arg(long, env = "SPLIT_SENSORS")]
-    split_sensors: Option<bool>,
+    /// Heart rate window size in seconds
+    #[arg(long, default_value = "10.0")]
+    hr_window_seconds: f32,
+
+    /// Heart rate window overlap percentage (0.0 to 1.0)
+    #[arg(long, default_value = "0.1")]
+    hr_window_overlap: f32,
+
+    /// Breathing rate window size in seconds
+    #[arg(long, default_value = "120.0")]
+    br_window_seconds: f32,
+
+    /// Breathing rate window overlap percentage (0.0 to 1.0)
+    #[arg(long, default_value = "0.0")]
+    br_window_overlap: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,8 +124,6 @@ struct PeriodAnalysis {
 
 #[derive(Debug)]
 struct SideAnalysis {
-    sensor1: PeriodAnalysis,
-    sensor2: PeriodAnalysis,
     combined: PeriodAnalysis,
     period_num: usize,
 }
@@ -127,7 +135,7 @@ struct BedAnalysis {
 }
 
 pub struct RawDataView<'a> {
-    raw_data: &'a [(u32, SensorData)],
+    raw_data: &'a [(u32, CombinedSensorData)],
     start_idx: usize,
     end_idx: usize,
 }
@@ -138,25 +146,12 @@ impl<'a> RawDataView<'a> {
             return None;
         }
 
-        if let SensorData::PiezoDual {
-            ts,
-            left1,
-            left2,
-            right1,
-            right2,
-            ..
-        } = &self.raw_data[self.start_idx + idx].1
-        {
-            Some(RawPeriodData {
-                timestamp: DateTime::from_timestamp(*ts, 0).unwrap(),
-                left1,
-                left2,
-                right1,
-                right2,
-            })
-        } else {
-            None
-        }
+        let data = &self.raw_data[self.start_idx + idx].1;
+        Some(RawPeriodData {
+            timestamp: DateTime::from_timestamp(data.ts, 0).unwrap(),
+            left: &data.left,
+            right: &data.right,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -171,31 +166,20 @@ impl<'a> RawDataView<'a> {
 #[derive(Debug)]
 pub struct RawPeriodData<'a> {
     pub timestamp: DateTime<Utc>,
-    pub left1: &'a [u8],
-    pub left2: &'a [u8],
-    pub right1: &'a [u8],
-    pub right2: &'a [u8],
+    pub left: &'a [i32],
+    pub right: &'a [i32],
 }
 
 fn create_raw_data_view<'a>(
-    raw_sensor_data: &'a [(u32, SensorData)],
+    raw_sensor_data: &'a [(u32, CombinedSensorData)],
     period: &'_ BedPresence,
 ) -> RawDataView<'a> {
-    let start_idx = raw_sensor_data.partition_point(|(_, data)| {
-        if let SensorData::PiezoDual { ts, .. } = data {
-            DateTime::from_timestamp(*ts, 0).unwrap() < period.start
-        } else {
-            true
-        }
-    });
+    let start_idx = raw_sensor_data
+        .partition_point(|(_, data)| DateTime::from_timestamp(data.ts, 0).unwrap() < period.start);
 
     let end_idx = start_idx
         + raw_sensor_data[start_idx..].partition_point(|(_, data)| {
-            if let SensorData::PiezoDual { ts, .. } = data {
-                DateTime::from_timestamp(*ts, 0).unwrap() <= period.end
-            } else {
-                false
-            }
+            DateTime::from_timestamp(data.ts, 0).unwrap() <= period.end
         });
 
     RawDataView {
@@ -233,53 +217,24 @@ fn calculate_stats(data: &[i32]) -> (f32, f32) {
     )
 }
 
-fn process_piezo_data(data: &SensorData) -> Option<ProcessedData> {
-    if let SensorData::PiezoDual {
-        ts,
-        left1,
-        left2,
-        right1,
-        right2,
-        ..
-    } = data
-    {
-        // Convert bytes to i32 values using from_le_bytes instead of from_ne_bytes
-        let left1_data: Vec<i32> = left1
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        let left2_data: Vec<i32> = left2
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        let right1_data: Vec<i32> = right1
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        let right2_data: Vec<i32> = right2
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+fn process_piezo_data(data: &CombinedSensorData) -> Option<ProcessedData> {
+    let timestamp = DateTime::from_timestamp(data.ts, 0).unwrap();
 
-        let (left1_mean, left1_std) = calculate_stats(&left1_data);
-        let (left2_mean, left2_std) = calculate_stats(&left2_data);
-        let (right1_mean, right1_std) = calculate_stats(&right1_data);
-        let (right2_mean, right2_std) = calculate_stats(&right2_data);
+    // Calculate stats for combined signals
+    let (left_mean, left_std) = calculate_stats(&data.left);
+    let (right_mean, right_std) = calculate_stats(&data.right);
 
-        Some(ProcessedData {
-            timestamp: DateTime::from_timestamp(*ts, 0).unwrap(),
-            left1_mean,
-            left1_std,
-            left2_mean,
-            left2_std,
-            right1_mean,
-            right1_std,
-            right2_mean,
-            right2_std,
-        })
-    } else {
-        None
-    }
+    Some(ProcessedData {
+        timestamp,
+        left1_mean: left_mean,
+        left1_std: left_std,
+        left2_mean: left_mean, // Use same values since signals are combined
+        left2_std: left_std,
+        right1_mean: right_mean,
+        right1_std: right_std,
+        right2_mean: right_mean, // Use same values since signals are combined
+        right2_std: right_std,
+    })
 }
 
 fn remove_stat_outliers_for_sensor(data: &mut Vec<ProcessedData>, sensor: &str) {
@@ -606,7 +561,7 @@ fn detect_bed_presence(data: &[ProcessedData], side: &str) -> Vec<BedPresence> {
 }
 
 fn extract_raw_data_for_period<'a>(
-    raw_sensor_data: &'a [(u32, SensorData)],
+    raw_sensor_data: &'a [(u32, CombinedSensorData)],
     period: &BedPresence,
 ) -> RawDataView<'a> {
     create_raw_data_view(raw_sensor_data, period)
@@ -714,9 +669,10 @@ fn analyse_sensor_data(
 }
 
 fn analyze_bed_presence_periods(
-    raw_sensor_data: &[(u32, SensorData)],
+    raw_sensor_data: &[(u32, CombinedSensorData)],
     left_periods: &[BedPresence],
     right_periods: &[BedPresence],
+    args: &Args,
 ) -> Result<BedAnalysis> {
     let mut bed_analysis = BedAnalysis {
         left_side: Vec::new(),
@@ -725,45 +681,30 @@ fn analyze_bed_presence_periods(
 
     println!("\nAnalyzing bed presence periods:");
 
-    // Get segment width and overlap from environment variables or use defaults
-    let segment_width_hr: f32 = env::var("HR_WINDOW_SECONDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10.0);
-
-    let overlap_percent_hr: f32 = env::var("HR_WINDOW_OVERLAP_PERCENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.1);
-
-    let segment_width_br: f32 = env::var("BR_WINDOW_SECONDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120.0);
-
-    let overlap_percent_br: f32 = env::var("BR_WINDOW_OVERLAP_PERCENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-
-    let samples_per_segment_hr = (segment_width_hr * 500.0) as usize;
-    let overlap_samples_hr = (samples_per_segment_hr as f32 * overlap_percent_hr) as usize;
+    let samples_per_segment_hr = (args.hr_window_seconds * 500.0) as usize;
+    let overlap_samples_hr = (samples_per_segment_hr as f32 * args.hr_window_overlap) as usize;
     let step_size_hr = samples_per_segment_hr - overlap_samples_hr;
 
-    let samples_per_segment_br = (segment_width_br * 500.0) as usize;
-    let overlap_samples_br = (samples_per_segment_br as f32 * overlap_percent_br) as usize;
+    let samples_per_segment_br = (args.br_window_seconds * 500.0) as usize;
+    let overlap_samples_br = (samples_per_segment_br as f32 * args.br_window_overlap) as usize;
     let step_size_br = samples_per_segment_br - overlap_samples_br;
 
     println!("\n  Processing with:");
-    println!("    (hr) Segment width : {} seconds", segment_width_hr);
-    println!("    (hr) Overlap: {}%", overlap_percent_hr * 100.0);
+    println!(
+        "    (hr) Segment width : {} seconds",
+        args.hr_window_seconds
+    );
+    println!("    (hr) Overlap: {}%", args.hr_window_overlap * 100.0);
     println!("    (hr) Samples per segment: {}", samples_per_segment_hr);
     println!("    (hr) Overlap samples: {}", overlap_samples_hr);
     println!("    (hr) Step size: {} samples", step_size_hr);
 
     println!("\n  --:");
-    println!("    (br) Segment width : {} seconds", segment_width_br);
-    println!("    (br) Overlap: {}%", overlap_percent_br * 100.0);
+    println!(
+        "    (br) Segment width : {} seconds",
+        args.br_window_seconds
+    );
+    println!("    (br) Overlap: {}%", args.br_window_overlap * 100.0);
     println!("    (br) Samples per segment: {}", samples_per_segment_br);
     println!("    (br) Overlap samples: {}", overlap_samples_br);
     println!("    (br) Step size: {} samples", step_size_br);
@@ -784,50 +725,15 @@ fn analyze_bed_presence_periods(
         // Extract and analyze raw data for the entire period
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        // Extract signals
+        // Extract signals from both sensors
         let signal1: Vec<i32> = (0..raw_data_view.len())
             .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .flat_map(|data| {
-                data.left1
-                    .chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            })
+            .map(|data| data.left.to_vec())
+            .flatten()
             .collect();
-
-        let signal2: Vec<i32> = (0..raw_data_view.len())
-            .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .flat_map(|data| {
-                data.left2
-                    .chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            })
-            .collect();
-
-        println!("\n  Analyzing left side period...");
-        let analysis1 = analyse_sensor_data(
-            &signal1,
-            &raw_data_view,
-            samples_per_segment_hr,
-            step_size_hr,
-            samples_per_segment_br,
-            step_size_br,
-        );
-
-        let analysis2 = analyse_sensor_data(
-            &signal2,
-            &raw_data_view,
-            samples_per_segment_hr,
-            step_size_hr,
-            samples_per_segment_br,
-            step_size_br,
-        );
 
         // Combine signals by averaging
-        let combined_signal: Vec<i32> = signal1
-            .iter()
-            .zip(signal2.iter())
-            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-            .collect();
+        let combined_signal = signal1;
 
         let analysis_combined = analyse_sensor_data(
             &combined_signal,
@@ -839,8 +745,6 @@ fn analyze_bed_presence_periods(
         );
 
         bed_analysis.left_side.push(SideAnalysis {
-            sensor1: analysis1,
-            sensor2: analysis2,
             combined: analysis_combined,
             period_num: i,
         });
@@ -862,50 +766,15 @@ fn analyze_bed_presence_periods(
         // Extract and analyze raw data for the entire period
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        // Extract signals
+        // Extract signals from both sensors
         let signal1: Vec<i32> = (0..raw_data_view.len())
             .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .flat_map(|data| {
-                data.right1
-                    .chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            })
+            .map(|data| data.right.to_vec()) // Use right side data
+            .flatten()
             .collect();
-
-        let signal2: Vec<i32> = (0..raw_data_view.len())
-            .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .flat_map(|data| {
-                data.right2
-                    .chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            })
-            .collect();
-
-        println!("\n  Analyzing right side period...");
-        let analysis1 = analyse_sensor_data(
-            &signal1,
-            &raw_data_view,
-            samples_per_segment_hr,
-            step_size_hr,
-            samples_per_segment_br,
-            step_size_br,
-        );
-
-        let analysis2 = analyse_sensor_data(
-            &signal2,
-            &raw_data_view,
-            samples_per_segment_hr,
-            step_size_hr,
-            samples_per_segment_br,
-            step_size_br,
-        );
 
         // Combine signals by averaging
-        let combined_signal: Vec<i32> = signal1
-            .iter()
-            .zip(signal2.iter())
-            .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-            .collect();
+        let combined_signal = signal1;
 
         let analysis_combined = analyse_sensor_data(
             &combined_signal,
@@ -917,8 +786,6 @@ fn analyze_bed_presence_periods(
         );
 
         bed_analysis.right_side.push(SideAnalysis {
-            sensor1: analysis1,
-            sensor2: analysis2,
             combined: analysis_combined,
             period_num: i,
         });
@@ -1005,82 +872,193 @@ fn parse_datetime(datetime_str: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
+#[derive(Debug)]
+struct RawFileInfo {
+    path: PathBuf,
+    first_seq: u32,
+    last_seq: u32,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+}
+
+fn build_raw_file_index(raw_dir: &PathBuf) -> Result<Vec<RawFileInfo>> {
+    let mut file_index = Vec::new();
+
+    for entry in std::fs::read_dir(raw_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().and_then(|s| s.to_str()) == Some("RAW") {
+            println!("Indexing file: {}", path.display());
+
+            // Load file to extract metadata
+            let items = decode_batch_item(&path)?;
+
+            if items.is_empty() {
+                println!("Skipping empty file: {}", path.display());
+                continue;
+            }
+
+            // Find sequence range and time range
+            let mut first_seq = u32::MAX;
+            let mut last_seq = 0;
+            let mut start_time = DateTime::<Utc>::MAX_UTC;
+            let mut end_time = DateTime::<Utc>::MIN_UTC;
+
+            for (seq, data) in &items {
+                if let SensorData::PiezoDual { ts, .. } = data {
+                    first_seq = first_seq.min(*seq);
+                    last_seq = last_seq.max(*seq);
+
+                    let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
+                    start_time = start_time.min(timestamp);
+                    end_time = end_time.max(timestamp);
+                }
+            }
+
+            file_index.push(RawFileInfo {
+                path,
+                first_seq,
+                last_seq,
+                start_time,
+                end_time,
+            });
+        }
+    }
+
+    // Sort by first sequence number
+    file_index.sort_by_key(|info| info.first_seq);
+
+    println!("\nFound {} RAW files:", file_index.len());
+    for info in &file_index {
+        println!(
+            "  {} (seq: {} to {}, time: {} to {})",
+            info.path.file_name().unwrap().to_string_lossy(),
+            info.first_seq,
+            info.last_seq,
+            info.start_time.format("%Y-%m-%d %H:%M:%S"),
+            info.end_time.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+
+    Ok(file_index)
+}
+
+#[derive(Debug)]
+struct CombinedSensorData {
+    ts: i64,
+    left: Vec<i32>,
+    right: Vec<i32>,
+}
+
+impl<'a> From<&'a SensorData> for Option<CombinedSensorData> {
+    fn from(data: &'a SensorData) -> Option<CombinedSensorData> {
+        if let SensorData::PiezoDual {
+            ts,
+            left1,
+            left2,
+            right1,
+            right2,
+            ..
+        } = data
+        {
+            let left: Vec<i32> = left1
+                .chunks_exact(4)
+                .zip(left2.chunks_exact(4))
+                .map(|(a, b)| {
+                    let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+                    let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    ((val1 as i64 + val2 as i64) / 2) as i32
+                })
+                .collect();
+
+            let right: Vec<i32> = right1
+                .chunks_exact(4)
+                .zip(right2.chunks_exact(4))
+                .map(|(a, b)| {
+                    let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+                    let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    ((val1 as i64 + val2 as i64) / 2) as i32
+                })
+                .collect();
+
+            Some(CombinedSensorData {
+                ts: *ts,
+                left,
+                right,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logger
     env_logger::init();
 
     let args = Args::parse();
-    let mut raw_sensor_data = Vec::new();
 
-    // First, load all RAW files and collect sensor data
-    for entry in std::fs::read_dir(args.raw_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("RAW") {
-            println!("Loading file: {}", path.display());
-            let items = decode_batch_item(&path)?;
-            raw_sensor_data.extend(items);
+    // Build index of RAW files
+    println!("Building RAW file index...");
+    let file_index = build_raw_file_index(&args.raw_dir)?;
+
+    if file_index.is_empty() {
+        println!("No RAW files found");
+        return Ok(());
+    }
+
+    // Parse time range if provided
+    let end_time = match args.end_time {
+        Some(ref t) => parse_datetime(t)?,
+        None => Utc::now(),
+    };
+
+    let start_time = match args.start_time {
+        Some(ref t) => parse_datetime(t)?,
+        None => end_time - chrono::Duration::days(1),
+    };
+
+    println!("\nAnalyzing data from {} to {}", start_time, end_time);
+
+    // Filter file index to only include files that overlap with our time range
+    let relevant_files: Vec<_> = file_index
+        .into_iter()
+        .filter(|info| info.end_time >= start_time && info.start_time <= end_time)
+        .collect();
+
+    println!(
+        "\nFound {} relevant files in time range",
+        relevant_files.len()
+    );
+
+    // Load and process files in sequence order
+    let mut raw_sensor_data = Vec::new();
+    for file_info in relevant_files {
+        println!("Loading file: {}", file_info.path.display());
+        let items = decode_batch_item(&file_info.path)?;
+
+        // Filter data by timestamp and convert to combined format
+        for (seq, data) in items {
+            if let Some(combined) = Option::<CombinedSensorData>::from(&data) {
+                let timestamp = DateTime::from_timestamp(combined.ts, 0).unwrap();
+                if timestamp >= start_time && timestamp <= end_time {
+                    raw_sensor_data.push((seq, combined));
+                }
+            }
         }
     }
 
     // Sort by sequence number and timestamp
-    raw_sensor_data.sort_by_key(|(seq, data)| {
-        if let SensorData::PiezoDual { ts, .. } = data {
-            (*seq, *ts)
-        } else {
-            (*seq, 0)
-        }
-    });
+    raw_sensor_data.sort_by_key(|(seq, data)| (*seq, data.ts));
 
     println!("Loaded {} raw sensor data points", raw_sensor_data.len());
-
-    if raw_sensor_data.is_empty() {
-        println!("No raw sensor data found");
-        return Ok(());
-    }
-
-    // Only filter by timeframe if start/end times were provided
-    if args.start_time.is_some() || args.end_time.is_some() {
-        let end_time = match args.end_time {
-            Some(ref t) => parse_datetime(t)?,
-            None => Utc::now(),
-        };
-
-        let start_time = match args.start_time {
-            Some(ref t) => parse_datetime(t)?,
-            None => end_time - chrono::Duration::days(1),
-        };
-
-        println!("Analyzing data from {} to {}", start_time, end_time);
-
-        // Filter data by timestamp after sorting
-        let initial_count = raw_sensor_data.len();
-        raw_sensor_data.retain(|(_seq, data)| {
-            if let SensorData::PiezoDual { ts, .. } = data {
-                let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
-                timestamp >= start_time && timestamp <= end_time
-            } else {
-                false
-            }
-        });
-
-        println!(
-            "Filtered {} data points to {} within specified timeframe",
-            initial_count,
-            raw_sensor_data.len()
-        );
-    }
 
     // Process all sensor data at once
     let mut all_processed_data: Vec<ProcessedData> = raw_sensor_data
         .iter()
-        .filter_map(|(seq, data)| {
-            let processed = process_piezo_data(data);
-            if processed.is_some() {
-                trace!("Processing seq {}", seq);
-            }
-            processed
-        })
+        .map(|(_, data)| process_piezo_data(data))
+        .flatten()
         .collect();
 
     // First remove time outliers
@@ -1102,16 +1080,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Determine bed presence periods based on whether time window is specified
     let (left_periods, right_periods) = if args.start_time.is_some() || args.end_time.is_some() {
-        let end_time = match args.end_time {
-            Some(ref t) => parse_datetime(t)?,
-            None => Utc::now(),
-        };
-
-        let start_time = match args.start_time {
-            Some(ref t) => parse_datetime(t)?,
-            None => end_time - chrono::Duration::days(1),
-        };
-
         // Create a single period for both sides
         let single_period = BedPresence {
             start: start_time,
@@ -1135,65 +1103,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Right side periods: {}", right_periods.len());
 
     let bed_analysis =
-        analyze_bed_presence_periods(&raw_sensor_data, &left_periods, &right_periods)?;
-
-    let hr_smoothing_window = args.hr_smoothing_window.unwrap_or(60);
+        analyze_bed_presence_periods(&raw_sensor_data, &left_periods, &right_periods, &args)?;
 
     // Write CSV files if output prefix was provided
     if let Some(prefix) = &args.csv_output {
         for analysis in &bed_analysis.left_side {
-            if let Some(split_sensors) = &args.split_sensors {
-                if *split_sensors == true {
-                    write_analysis_to_csv(
-                        prefix,
-                        "left",
-                        analysis.period_num,
-                        &analysis.sensor1,
-                        hr_smoothing_window,
-                    )?;
-                    write_analysis_to_csv(
-                        prefix,
-                        "left2",
-                        analysis.period_num,
-                        &analysis.sensor2,
-                        hr_smoothing_window,
-                    )?;
-                }
-            }
             write_analysis_to_csv(
                 prefix,
                 "left_combined",
                 analysis.period_num,
                 &analysis.combined,
-                hr_smoothing_window,
+                args.hr_smoothing_window,
             )?;
         }
 
         for analysis in &bed_analysis.right_side {
-            if let Some(split_sensors) = &args.split_sensors {
-                if *split_sensors == true {
-                    write_analysis_to_csv(
-                        prefix,
-                        "right",
-                        analysis.period_num,
-                        &analysis.sensor1,
-                        hr_smoothing_window,
-                    )?;
-                    write_analysis_to_csv(
-                        prefix,
-                        "right2",
-                        analysis.period_num,
-                        &analysis.sensor2,
-                        hr_smoothing_window,
-                    )?;
-                }
-            }
             write_analysis_to_csv(
                 prefix,
                 "right_combined",
                 analysis.period_num,
                 &analysis.combined,
-                hr_smoothing_window,
+                args.hr_smoothing_window,
             )?;
         }
     }
