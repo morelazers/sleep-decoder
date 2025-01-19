@@ -141,6 +141,16 @@ impl HeartRateHistory {
 
         Some((last_rate - first_rate) / duration_mins)
     }
+
+    pub fn get_recent_rates(&self, count: usize) -> Vec<f32> {
+        // Take the last 'count' measurements
+        self.rates
+            .iter()
+            .rev() // Reverse to get most recent first
+            .take(count) // Take only the number we want
+            .map(|(_, rate)| *rate)
+            .collect()
+    }
 }
 
 /// FFT context holding reusable buffers and planner
@@ -493,8 +503,8 @@ pub fn analyze_heart_rate_fft(
     // Sort peaks by adjusted magnitude
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    // If we have a previous heart rate, try to find a peak close to it
-    if let Some(prev_hr) = prev_hr {
+    // Find peaks and validate them...
+    let result = if let Some(prev_hr) = prev_hr {
         let top_peaks: Vec<(f32, f32)> = peaks
             .iter()
             .take(7)
@@ -510,7 +520,6 @@ pub fn analyze_heart_rate_fft(
 
             let (bpm, magnitude) = *best_peak;
 
-            // After finding best peak but before applying it:
             // Check if the change is physiologically plausible
             let window_duration = if let Some((first_ts, _)) = history.rates.first() {
                 (timestamp - *first_ts).num_seconds() as f32
@@ -520,54 +529,78 @@ pub fn analyze_heart_rate_fft(
 
             if !is_physiologically_plausible(bpm, prev_hr, window_duration) {
                 debug!(
-                    "Change not physiologically plausible: {:.1} -> {:.1} BPM",
-                    prev_hr, bpm
+                    "Time: {:?} Change not physiologically plausible: {:.1} -> {:.1} BPM",
+                    timestamp, prev_hr, bpm
                 );
-                let smoothed_bpm = prev_hr;
-                history.add_measurement(timestamp, smoothed_bpm);
-                return Some(smoothed_bpm);
+                return None;
             }
 
             // Check if this change is suspicious
             if is_suspicious_change(bpm, magnitude, peaks[0].1, prev_hr) {
-                let maintained_hr = prev_hr;
-                history.add_measurement(timestamp, maintained_hr);
-                return Some(maintained_hr);
+                debug!(
+                    "Time: {:?} Rejecting suspicious HR change: {:.1} -> {:.1} BPM",
+                    timestamp, prev_hr, bpm
+                );
+                return None;
             }
 
-            // Calculate and apply confidence-based weighting
-            let confidence = {
-                let normalized_magnitude = magnitude / peaks[0].1;
-                let hr_change = (bpm - prev_hr).abs();
-                let change_penalty = (hr_change / 20.0).min(0.5);
-                (normalized_magnitude - change_penalty).max(0.0)
-            };
+            // Check if this is an outlier compared to recent history
+            let recent_rates = history.get_recent_rates(180);
+            let is_valid = if !recent_rates.is_empty() {
+                let mut sorted_rates = recent_rates;
+                sorted_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-            let smoothed_bpm = if confidence >= 0.8 {
-                let weight = 0.8;
-                bpm * weight + prev_hr * (1.0 - weight)
-            } else if confidence >= 0.6 {
-                let weight = confidence / 2.5;
-                bpm * weight + prev_hr * (1.0 - weight)
+                let lower_idx = (sorted_rates.len() as f32 * 0.02) as usize;
+                let upper_idx = (sorted_rates.len() as f32 * 0.98) as usize;
+                let mut lower_bound = sorted_rates[lower_idx];
+                let mut upper_bound = sorted_rates[upper_idx];
+
+                if (upper_bound - lower_bound) < 25.0 {
+                    let mean: f32 = sorted_rates.iter().sum::<f32>() / sorted_rates.len() as f32;
+                    lower_bound = mean - 12.5;
+                    upper_bound = mean + 12.5;
+                }
+
+                debug!(
+                    "Time: {:?} Lower bound: {:?} Upper bound: {:?}",
+                    timestamp, lower_bound, upper_bound
+                );
+
+                if bpm <= lower_bound || bpm >= upper_bound {
+                    debug!(
+                        "Time: {:?} Rejecting outlier HR {:.1} BPM (bounds: {:.1}-{:.1})",
+                        timestamp, bpm, lower_bound, upper_bound
+                    );
+                    false
+                } else {
+                    true
+                }
             } else {
-                let weight = 0.05;
-                bpm * weight + prev_hr * (1.0 - weight)
+                true
             };
 
-            history.add_measurement(timestamp, smoothed_bpm);
-            return Some(smoothed_bpm);
+            if is_valid {
+                history.add_measurement(timestamp, bpm);
+                Some(bpm)
+            } else {
+                None
+            }
+        } else {
+            None
         }
-    }
+    } else {
+        // No previous HR, use strongest peak in valid range
+        peaks
+            .first()
+            .map(|&(bpm, _)| bpm)
+            .filter(|&bpm| bpm >= 40.0 && bpm <= 100.0)
+    };
 
-    // If no previous HR or no suitable peaks found near previous HR,
-    // return the strongest peak if it's in valid range
-    let result = peaks
-        .first()
-        .map(|&(bpm, _)| bpm)
-        .filter(|&bpm| bpm >= 40.0 && bpm <= 100.0);
-
+    // Add to history if we found a valid rate
     if let Some(bpm) = result {
-        history.add_measurement(timestamp, bpm);
+        if prev_hr.is_none() {
+            history.add_measurement(timestamp, bpm);
+        }
     }
 
     result

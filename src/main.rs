@@ -49,6 +49,10 @@ struct Args {
     /// Breathing rate window overlap percentage (0.0 to 1.0)
     #[arg(long, default_value = "0.0")]
     br_window_overlap: f32,
+
+    /// Merge left and right signals for analysis
+    #[arg(long)]
+    merge_sides: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,12 +729,26 @@ fn analyze_bed_presence_periods(
         // Extract and analyze raw data for the entire period
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        // Extract signals from both sensors
-        let combined_signal: Vec<i32> = (0..raw_data_view.len())
+        // Extract signals
+        let mut combined_signal: Vec<i32> = (0..raw_data_view.len())
             .filter_map(|idx| raw_data_view.get_data_at(idx))
             .map(|data| data.left.to_vec())
             .flatten()
             .collect();
+
+        // If merging sides, add right side data
+        if args.merge_sides {
+            let right_signal: Vec<i32> = (0..raw_data_view.len())
+                .filter_map(|idx| raw_data_view.get_data_at(idx))
+                .map(|data| data.right.to_vec())
+                .flatten()
+                .collect();
+
+            // Average the signals
+            for (left, right) in combined_signal.iter_mut().zip(right_signal.iter()) {
+                *left = ((*left as i64 + *right as i64) / 2) as i32;
+            }
+        }
 
         let analysis_combined = analyse_sensor_data(
             &combined_signal,
@@ -747,42 +765,45 @@ fn analyze_bed_presence_periods(
         });
     }
 
-    // Analyze right side periods
-    for (i, period) in right_periods.iter().enumerate() {
-        println!("\nRight side period {}", i + 1);
-        println!(
-            "  {} to {}",
-            period.start.format("%Y-%m-%d %H:%M"),
-            period.end.format("%Y-%m-%d %H:%M")
-        );
-        println!(
-            "  Duration: {} minutes",
-            (period.end - period.start).num_minutes()
-        );
+    // Only analyze right side if not merging
+    if !args.merge_sides {
+        // Analyze right side periods
+        for (i, period) in right_periods.iter().enumerate() {
+            println!("\nRight side period {}", i + 1);
+            println!(
+                "  {} to {}",
+                period.start.format("%Y-%m-%d %H:%M"),
+                period.end.format("%Y-%m-%d %H:%M")
+            );
+            println!(
+                "  Duration: {} minutes",
+                (period.end - period.start).num_minutes()
+            );
 
-        // Extract and analyze raw data for the entire period
-        let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
+            // Extract and analyze raw data for the entire period
+            let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        // Extract signals from both sensors
-        let combined_signal: Vec<i32> = (0..raw_data_view.len())
-            .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .map(|data| data.right.to_vec()) // Use right side data
-            .flatten()
-            .collect();
+            // Extract signals
+            let combined_signal: Vec<i32> = (0..raw_data_view.len())
+                .filter_map(|idx| raw_data_view.get_data_at(idx))
+                .map(|data| data.right.to_vec())
+                .flatten()
+                .collect();
 
-        let analysis_combined = analyse_sensor_data(
-            &combined_signal,
-            &raw_data_view,
-            samples_per_segment_hr,
-            step_size_hr,
-            samples_per_segment_br,
-            step_size_br,
-        );
+            let analysis_combined = analyse_sensor_data(
+                &combined_signal,
+                &raw_data_view,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
+            );
 
-        bed_analysis.right_side.push(SideAnalysis {
-            combined: analysis_combined,
-            period_num: i,
-        });
+            bed_analysis.right_side.push(SideAnalysis {
+                combined: analysis_combined,
+                period_num: i,
+            });
+        }
     }
 
     Ok(bed_analysis)
