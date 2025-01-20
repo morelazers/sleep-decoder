@@ -9,6 +9,9 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use crate::phase_analysis::SleepPhase;
+
+mod phase_analysis;
 
 /// Process sleep data from RAW files
 #[derive(Parser, Debug)]
@@ -130,6 +133,7 @@ struct PeriodAnalysis {
 struct SideAnalysis {
     combined: PeriodAnalysis,
     period_num: usize,
+    sleep_phases: Vec<(DateTime<Utc>, SleepPhase)>,
 }
 
 #[derive(Debug)]
@@ -759,9 +763,23 @@ fn analyze_bed_presence_periods(
             step_size_br,
         );
 
+        // Analyze sleep phases starting 30 minutes after period start
+        let sleep_onset = period.start + chrono::Duration::minutes(30);
+        let sleep_phases = phase_analysis::analyze_sleep_phases(
+            &analysis_combined,
+            sleep_onset,
+            Some(phase_analysis::PhaseConfig::default()),
+        );
+
+        println!(
+            "  Detected {} sleep phase transitions",
+            sleep_phases.len()
+        );
+
         bed_analysis.left_side.push(SideAnalysis {
             combined: analysis_combined,
             period_num: i,
+            sleep_phases,
         });
     }
 
@@ -799,9 +817,23 @@ fn analyze_bed_presence_periods(
                 step_size_br,
             );
 
+            // Analyze sleep phases starting 30 minutes after period start
+            let sleep_onset = period.start + chrono::Duration::minutes(30);
+            let sleep_phases = phase_analysis::analyze_sleep_phases(
+                &analysis_combined,
+                sleep_onset,
+                Some(phase_analysis::PhaseConfig::default()),
+            );
+
+            println!(
+                "  Detected {} sleep phase transitions",
+                sleep_phases.len()
+            );
+
             bed_analysis.right_side.push(SideAnalysis {
                 combined: analysis_combined,
                 period_num: i,
+                sleep_phases,
             });
         }
     }
@@ -815,6 +847,7 @@ fn write_analysis_to_csv(
     period_num: usize,
     analysis: &PeriodAnalysis,
     hr_smoothing_window: usize,
+    sleep_phases: &[(DateTime<Utc>, SleepPhase)],
 ) -> Result<()> {
     let path = std::path::Path::new(base_path);
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -835,6 +868,7 @@ fn write_analysis_to_csv(
     let mut timestamps: Vec<DateTime<Utc>> = Vec::new();
     timestamps.extend(analysis.fft_heart_rates.iter().map(|(t, _)| *t));
     timestamps.extend(analysis.breathing_rates.iter().map(|(t, _)| *t));
+    timestamps.extend(sleep_phases.iter().map(|(t, _)| *t));
     timestamps.sort_unstable();
     timestamps.dedup();
 
@@ -846,7 +880,7 @@ fn write_analysis_to_csv(
     );
 
     // Write header
-    writer.write_record(&["timestamp", "fft_hr", "fft_hr_smoothed", "breathing_rate"])?;
+    writer.write_record(&["timestamp", "fft_hr", "fft_hr_smoothed", "breathing_rate", "sleep_phase"])?;
 
     // Write data for each timestamp
     for &timestamp in &timestamps {
@@ -870,11 +904,20 @@ fn write_analysis_to_csv(
             .map(|(_, br)| br.to_string())
             .unwrap_or_default();
 
+        // Find the current sleep phase
+        let phase = sleep_phases
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= timestamp)
+            .map(|(_, phase)| format!("{:?}", phase))
+            .unwrap_or_default();
+
         writer.write_record(&[
             timestamp.format("%Y-%m-%d %H:%M").to_string(),
             fft_hr,
             fft_hr_smoothed,
             br,
+            phase,
         ])?;
     }
 
@@ -1129,6 +1172,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 analysis.period_num,
                 &analysis.combined,
                 args.hr_smoothing_window,
+                &analysis.sleep_phases,
             )?;
         }
 
@@ -1139,6 +1183,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 analysis.period_num,
                 &analysis.combined,
                 args.hr_smoothing_window,
+                &analysis.sleep_phases,
             )?;
         }
     }
