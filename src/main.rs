@@ -1,3 +1,4 @@
+use crate::phase_analysis::SleepPhase;
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
@@ -9,7 +10,6 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
-use crate::phase_analysis::SleepPhase;
 
 mod phase_analysis;
 
@@ -764,17 +764,11 @@ fn analyze_bed_presence_periods(
         );
 
         // Analyze sleep phases starting 30 minutes after period start
-        let sleep_onset = period.start + chrono::Duration::minutes(30);
-        let sleep_phases = phase_analysis::analyze_sleep_phases(
-            &analysis_combined,
-            sleep_onset,
-            Some(phase_analysis::PhaseConfig::default()),
-        );
+        let sleep_onset = period.start;
+        let sleep_phases = phase_analysis::analyze_sleep_phases(&analysis_combined, sleep_onset);
 
-        println!(
-            "  Detected {} sleep phase transitions",
-            sleep_phases.len()
-        );
+        // Print sleep phase summary
+        phase_analysis::summarize_sleep_phases(&sleep_phases);
 
         bed_analysis.left_side.push(SideAnalysis {
             combined: analysis_combined,
@@ -818,17 +812,14 @@ fn analyze_bed_presence_periods(
             );
 
             // Analyze sleep phases starting 30 minutes after period start
-            let sleep_onset = period.start + chrono::Duration::minutes(30);
-            let sleep_phases = phase_analysis::analyze_sleep_phases(
-                &analysis_combined,
-                sleep_onset,
-                Some(phase_analysis::PhaseConfig::default()),
-            );
+            let sleep_onset = period.start;
+            let sleep_phases =
+                phase_analysis::analyze_sleep_phases(&analysis_combined, sleep_onset);
 
-            println!(
-                "  Detected {} sleep phase transitions",
-                sleep_phases.len()
-            );
+            // Print sleep phase summary
+            phase_analysis::summarize_sleep_phases(&sleep_phases);
+
+            println!("  Detected {} sleep phase transitions", sleep_phases.len());
 
             bed_analysis.right_side.push(SideAnalysis {
                 combined: analysis_combined,
@@ -880,7 +871,13 @@ fn write_analysis_to_csv(
     );
 
     // Write header
-    writer.write_record(&["timestamp", "fft_hr", "fft_hr_smoothed", "breathing_rate", "sleep_phase"])?;
+    writer.write_record(&[
+        "timestamp",
+        "fft_hr",
+        "fft_hr_smoothed",
+        "breathing_rate",
+        "sleep_phase",
+    ])?;
 
     // Write data for each timestamp
     for &timestamp in &timestamps {
