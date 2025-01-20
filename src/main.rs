@@ -17,9 +17,13 @@ mod phase_analysis;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Directory containing .RAW files
-    #[arg(help = "Directory containing .RAW files")]
-    raw_dir: PathBuf,
+    /// Directory containing .RAW files or path to input CSV
+    #[arg(help = "Directory containing .RAW files or path to input CSV")]
+    input_path: PathBuf,
+
+    /// Whether the input is a CSV file
+    #[arg(long)]
+    csv_input: bool,
 
     /// Start time (format: YYYY-MM-DD HH:MM), defaults to 24 hours ago
     #[arg(long, env = "ANALYSIS_START_TIME")]
@@ -56,6 +60,34 @@ struct Args {
     /// Merge left and right signals for analysis
     #[arg(long)]
     merge_sides: bool,
+
+    /// Percentile threshold for HR outlier detection (0.0 to 0.5, default 0.05 means using 5th and 95th percentiles)
+    #[arg(long, default_value = "0.05")]
+    hr_outlier_percentile: f32,
+
+    /// Number of recent heart rate measurements to consider for outlier detection
+    #[arg(long, default_value = "60")]
+    hr_history_window: usize,
+
+    /// Base penalty for breathing harmonics when close to previous HR (0.0 to 1.0)
+    #[arg(long, default_value = "0.8")]
+    harmonic_penalty_close: f32,
+
+    /// Base penalty for breathing harmonics when far from previous HR (0.0 to 1.0)
+    #[arg(long, default_value = "0.5")]
+    harmonic_penalty_far: f32,
+
+    /// BPM difference threshold for "close" harmonic penalty (in BPM)
+    #[arg(long, default_value = "5.0")]
+    harmonic_close_threshold: f32,
+
+    /// BPM difference threshold for "far" harmonic penalty (in BPM)
+    #[arg(long, default_value = "10.0")]
+    harmonic_far_threshold: f32,
+
+    /// Smoothing strength for heart rate data (0.1 to 2.0, higher = more smoothing, default 0.25)
+    #[arg(long, default_value = "0.25")]
+    hr_smoothing_strength: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,21 +118,15 @@ enum SensorData {
         gain: u16,
         #[serde(with = "serde_bytes")]
         left1: Vec<u8>,
+        #[serde(default)]
         #[serde(with = "serde_bytes")]
-        left2: Vec<u8>,
+        left2: Option<Vec<u8>>,
         #[serde(with = "serde_bytes")]
         right1: Vec<u8>,
+        #[serde(default)]
         #[serde(with = "serde_bytes")]
-        right2: Vec<u8>,
-    },
-    #[serde(rename = "bedTemp")]
-    BedTemp {
-        ts: i64,
-        mcu: f32,
-        amb: f32,
-        left: BedTempSide,
-        right: BedTempSide,
-    },
+        right2: Option<Vec<u8>>,
+    }
 }
 
 #[derive(Debug, Serialize, Copy, Clone)]
@@ -584,6 +610,12 @@ fn analyse_sensor_data(
     step_size_hr: usize,
     samples_per_segment_br: usize,
     step_size_br: usize,
+    hr_outlier_percentile: f32,
+    hr_history_window: usize,
+    harmonic_penalty_close: f32,
+    harmonic_penalty_far: f32,
+    harmonic_close_threshold: f32,
+    harmonic_far_threshold: f32,
 ) -> PeriodAnalysis {
     let mut fft_heart_rates = Vec::new();
     let mut breathing_rates = Vec::new();
@@ -664,6 +696,12 @@ fn analyse_sensor_data(
             &mut hr_fft_context,
             time_step,
             breathing_data,
+            hr_outlier_percentile,
+            hr_history_window,
+            harmonic_penalty_close,
+            harmonic_penalty_far,
+            harmonic_close_threshold,
+            harmonic_far_threshold,
         ) {
             fft_heart_rates.push((window.timestamp, fft_hr));
             prev_fft_hr = Some(fft_hr);
@@ -761,6 +799,12 @@ fn analyze_bed_presence_periods(
             step_size_hr,
             samples_per_segment_br,
             step_size_br,
+            args.hr_outlier_percentile,
+            args.hr_history_window,
+            args.harmonic_penalty_close,
+            args.harmonic_penalty_far,
+            args.harmonic_close_threshold,
+            args.harmonic_far_threshold,
         );
 
         // Analyze sleep phases starting 30 minutes after period start
@@ -809,6 +853,12 @@ fn analyze_bed_presence_periods(
                 step_size_hr,
                 samples_per_segment_br,
                 step_size_br,
+                args.hr_outlier_percentile,
+                args.hr_history_window,
+                args.harmonic_penalty_close,
+                args.harmonic_penalty_far,
+                args.harmonic_close_threshold,
+                args.harmonic_far_threshold,
             );
 
             // Analyze sleep phases starting 30 minutes after period start
@@ -838,6 +888,7 @@ fn write_analysis_to_csv(
     period_num: usize,
     analysis: &PeriodAnalysis,
     hr_smoothing_window: usize,
+    hr_smoothing_strength: f32,
     sleep_phases: &[(DateTime<Utc>, SleepPhase)],
 ) -> Result<()> {
     let path = std::path::Path::new(base_path);
@@ -868,6 +919,7 @@ fn write_analysis_to_csv(
         &timestamps,
         &analysis.fft_heart_rates,
         hr_smoothing_window,
+        hr_smoothing_strength,
     );
 
     // Write header
@@ -1017,25 +1069,43 @@ impl<'a> From<&'a SensorData> for Option<CombinedSensorData> {
             ..
         } = data
         {
-            let left: Vec<i32> = left1
-                .chunks_exact(4)
-                .zip(left2.chunks_exact(4))
-                .map(|(a, b)| {
-                    let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-                    let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    ((val1 as i64 + val2 as i64) / 2) as i32
-                })
-                .collect();
+            // Convert left side data
+            let left: Vec<i32> = match left2 {
+                // If we have left2, average left1 and left2
+                Some(left2_data) => left1
+                    .chunks_exact(4)
+                    .zip(left2_data.chunks_exact(4))
+                    .map(|(a, b)| {
+                        let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+                        let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        ((val1 as i64 + val2 as i64) / 2) as i32
+                    })
+                    .collect(),
+                // If no left2, just convert left1
+                None => left1
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect(),
+            };
 
-            let right: Vec<i32> = right1
-                .chunks_exact(4)
-                .zip(right2.chunks_exact(4))
-                .map(|(a, b)| {
-                    let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-                    let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    ((val1 as i64 + val2 as i64) / 2) as i32
-                })
-                .collect();
+            // Convert right side data
+            let right: Vec<i32> = match right2 {
+                // If we have right2, average right1 and right2
+                Some(right2_data) => right1
+                    .chunks_exact(4)
+                    .zip(right2_data.chunks_exact(4))
+                    .map(|(a, b)| {
+                        let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+                        let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        ((val1 as i64 + val2 as i64) / 2) as i32
+                    })
+                    .collect(),
+                // If no right2, just convert right1
+                None => right1
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect(),
+            };
 
             Some(CombinedSensorData {
                 ts: *ts,
@@ -1048,63 +1118,143 @@ impl<'a> From<&'a SensorData> for Option<CombinedSensorData> {
     }
 }
 
+// Add new function to read CSV data
+fn read_csv_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
+    let file = File::open(path)?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)  // Handle variable number of fields
+        .from_reader(file);
+    let mut data = Vec::new();
+
+    for result in rdr.records() {
+        let record = result?;
+
+        // Parse the timestamp from datetime string
+        let dt = NaiveDateTime::parse_from_str(record.get(1).unwrap(), "%Y-%m-%d %H:%M:%S")?;
+        let ts = dt.timestamp();
+
+        let freq: u16 = record.get(2).unwrap().parse()?;
+        let adc: u8 = record.get(3).unwrap().parse()?;
+        let gain: u16 = record.get(4).unwrap().parse()?;
+
+        // Parse left1 and right1 as space-separated integers
+        let parse_signal = |s: &str| -> Result<Vec<i32>> {
+            // Remove square brackets and split on whitespace
+            let cleaned = s.trim_matches(|c| c == '[' || c == ']' || c == ' ')
+                .split_whitespace()  // This handles multiple spaces and newlines
+                .filter(|s| !s.is_empty());
+
+            cleaned
+                .map(|s| s.parse::<i32>())
+                .collect::<Result<Vec<i32>, _>>()
+                .map_err(|e| anyhow::anyhow!("Failed to parse signal data: {}", e))
+        };
+
+        let left1 = parse_signal(record.get(5).unwrap())?;
+        let right1 = parse_signal(record.get(6).unwrap())?;
+        let seq: u32 = record.get(7).unwrap().parse()?;
+
+        // Create CombinedSensorData
+        let combined = CombinedSensorData {
+            ts,
+            left: left1,
+            right: right1,
+        };
+
+        data.push((seq, combined));
+    }
+
+    Ok(data)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logger
     env_logger::init();
 
     let args = Args::parse();
 
-    // Build index of RAW files
-    println!("Building RAW file index...");
-    let file_index = build_raw_file_index(&args.raw_dir)?;
+    // Only parse and apply time range if provided
+    let (start_time, end_time) = if args.start_time.is_some() || args.end_time.is_some() {
+        let end_time = match args.end_time {
+            Some(ref t) => parse_datetime(t)?,
+            None => Utc::now(),
+        };
 
-    if file_index.is_empty() {
-        println!("No RAW files found");
-        return Ok(());
-    }
+        let start_time = match args.start_time {
+            Some(ref t) => parse_datetime(t)?,
+            None => end_time - chrono::Duration::days(1),
+        };
 
-    // Parse time range if provided
-    let end_time = match args.end_time {
-        Some(ref t) => parse_datetime(t)?,
-        None => Utc::now(),
+        println!("\nAnalyzing data from {} to {}", start_time, end_time);
+        (Some(start_time), Some(end_time))
+    } else {
+        (None, None)
     };
 
-    let start_time = match args.start_time {
-        Some(ref t) => parse_datetime(t)?,
-        None => end_time - chrono::Duration::days(1),
-    };
+    // Load raw sensor data based on input type
+    let raw_sensor_data = if args.csv_input {
+        println!("Reading from CSV file: {}", args.input_path.display());
+        let mut data = read_csv_file(&args.input_path)?;
 
-    println!("\nAnalyzing data from {} to {}", start_time, end_time);
+        println!("Loaded {} rows from CSV", data.len());
 
-    // Filter file index to only include files that overlap with our time range
-    let relevant_files: Vec<_> = file_index
-        .into_iter()
-        .filter(|info| info.end_time >= start_time && info.start_time <= end_time)
-        .collect();
-
-    println!(
-        "\nFound {} relevant files in time range",
-        relevant_files.len()
-    );
-
-    // Load and process files in sequence order
-    let mut raw_sensor_data = Vec::new();
-    for file_info in relevant_files {
-        println!("Loading file: {}", file_info.path.display());
-        let items = decode_batch_item(&file_info.path)?;
-
-        // Filter data by timestamp and convert to combined format
-        for (seq, data) in items {
-            if let Some(combined) = Option::<CombinedSensorData>::from(&data) {
+        // Only filter by time range if provided
+        if let (Some(start), Some(end)) = (start_time, end_time) {
+            data.retain(|(_, combined)| {
                 let timestamp = DateTime::from_timestamp(combined.ts, 0).unwrap();
-                if timestamp >= start_time && timestamp <= end_time {
-                    raw_sensor_data.push((seq, combined));
+                timestamp >= start && timestamp <= end
+            });
+        }
+        data
+    } else {
+        println!("Building RAW file index...");
+        let file_index = build_raw_file_index(&args.input_path)?;
+
+        if file_index.is_empty() {
+            println!("No RAW files found");
+            return Ok(());
+        }
+
+        // Only filter files by time range if provided
+        let relevant_files = if let (Some(start), Some(end)) = (start_time, end_time) {
+            file_index
+                .into_iter()
+                .filter(|info| info.end_time >= start && info.start_time <= end)
+                .collect()
+        } else {
+            file_index
+        };
+
+        println!(
+            "\nProcessing {} RAW files",
+            relevant_files.len()
+        );
+
+        // Load and process files in sequence order
+        let mut data = Vec::new();
+        for file_info in relevant_files {
+            println!("Loading file: {}", file_info.path.display());
+            let items = decode_batch_item(&file_info.path)?;
+
+            // Filter data by timestamp and convert to combined format
+            for (seq, sensor_data) in items {
+                if let Some(combined) = Option::<CombinedSensorData>::from(&sensor_data) {
+                    if let (Some(start), Some(end)) = (start_time, end_time) {
+                        let timestamp = DateTime::from_timestamp(combined.ts, 0).unwrap();
+                        if timestamp >= start && timestamp <= end {
+                            data.push((seq, combined));
+                        }
+                    } else {
+                        data.push((seq, combined));
+                    }
                 }
             }
         }
-    }
+        data
+    };
 
     // Sort by sequence number and timestamp
+    let mut raw_sensor_data = raw_sensor_data;
     raw_sensor_data.sort_by_key(|(seq, data)| (*seq, data.ts));
 
     println!("Loaded {} raw sensor data points", raw_sensor_data.len());
@@ -1134,11 +1284,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     scale_data(&mut all_processed_data);
 
     // Determine bed presence periods based on whether time window is specified
-    let (left_periods, right_periods) = if args.start_time.is_some() || args.end_time.is_some() {
+    let (left_periods, right_periods) = if let (Some(start), Some(end)) = (start_time, end_time) {
         // Create a single period for both sides
         let single_period = BedPresence {
-            start: start_time,
-            end: end_time,
+            start,
+            end,
             confidence: 1.0,
         };
 
@@ -1169,6 +1319,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 analysis.period_num,
                 &analysis.combined,
                 args.hr_smoothing_window,
+                args.hr_smoothing_strength,
                 &analysis.sleep_phases,
             )?;
         }
@@ -1180,6 +1331,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 analysis.period_num,
                 &analysis.combined,
                 args.hr_smoothing_window,
+                args.hr_smoothing_strength,
                 &analysis.sleep_phases,
             )?;
         }

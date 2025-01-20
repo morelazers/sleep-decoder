@@ -5,6 +5,8 @@ use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use sci_rs::signal::filter::{design::Sos, sosfiltfilt_dyn};
 use std::f32::consts::PI;
 use std::sync::Arc;
+use std::error::Error;
+use csv;
 
 /// A window of signal data with its metadata
 pub struct SignalWindow {
@@ -357,20 +359,20 @@ fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
     };
 
     // Make the range slightly asymmetric - less aggressive downward bias
-    let upward_change = max_change * 0.85; // Changed from 0.7 - allow more upward movement
-    let downward_change = max_change * 0.9; // Add small restriction to downward movement too
+    let upward_change = max_change * 0.85;
+    let downward_change = max_change * 0.9;
 
     // Calculate range with smaller buffer
     let min_hr = (prev_hr - downward_change - 3.0).max(35.0);
-    let max_hr = (prev_hr + upward_change + 3.0).min(95.0);
+    let max_hr = (prev_hr + upward_change + 3.0).min(85.0);
 
     // Less aggressive HR zone restrictions
-    let max_hr = if prev_hr < 60.0 {
+    let max_hr = if prev_hr < 70.0 {
         // Low HR zone - allow more upward movement
-        (prev_hr + upward_change * 0.8).min(80.0) // Changed from 0.6 and 75.0
+        (prev_hr + upward_change * 0.8).min(80.0)
     } else if prev_hr < 75.0 {
         // Medium HR zone
-        (prev_hr + upward_change * 0.9).min(90.0) // Changed from 0.8 and 85.0
+        (prev_hr + upward_change * 0.9).min(85.0)
     } else {
         // High HR zone
         max_hr
@@ -400,6 +402,10 @@ fn calculate_harmonic_penalty(
     bpm: f32,
     breathing_data: Option<(f32, f32)>,
     prev_hr: Option<f32>,
+    harmonic_penalty_close: f32,
+    harmonic_penalty_far: f32,
+    harmonic_close_threshold: f32,
+    harmonic_far_threshold: f32,
 ) -> f32 {
     if let Some((br, stability)) = breathing_data {
         // Calculate breathing harmonics
@@ -416,14 +422,18 @@ fn calculate_harmonic_penalty(
             // If we have a previous heart rate, check if this peak is close to it
             if let Some(prev_hr) = prev_hr {
                 let freq_diff = (bpm - prev_hr).abs();
-                if freq_diff < 5.0 {
+                if freq_diff < harmonic_close_threshold {
                     // If very close to previous HR, don't penalize
                     1.0
                 } else {
                     // Scale penalty by breathing stability
                     // High stability (1.0) -> full penalty
                     // Low stability (0.0) -> minimal penalty
-                    let base_penalty = if freq_diff < 10.0 { 0.8 } else { 0.5 };
+                    let base_penalty = if freq_diff < harmonic_far_threshold {
+                        harmonic_penalty_close
+                    } else {
+                        harmonic_penalty_far
+                    };
                     1.0 - (1.0 - base_penalty) * stability
                 }
             } else {
@@ -448,6 +458,12 @@ pub fn analyze_heart_rate_fft(
     fft_context: &mut FftContext,
     time_step: f32,
     breathing_data: Option<(f32, f32)>, // (rate, stability)
+    hr_outlier_percentile: f32,
+    hr_history_window: usize,
+    harmonic_penalty_close: f32,
+    harmonic_penalty_far: f32,
+    harmonic_close_threshold: f32,
+    harmonic_far_threshold: f32,
 ) -> Option<f32> {
     // Check both trend and physiological plausibility
     if let Some(prev_hr) = prev_hr {
@@ -494,7 +510,16 @@ pub fn analyze_heart_rate_fft(
             let bpm = freq * 60.0;
 
             // Calculate harmonic penalty
-            let harmonic_factor = calculate_harmonic_penalty(freq, bpm, breathing_data, prev_hr);
+            let harmonic_factor = calculate_harmonic_penalty(
+                freq,
+                bpm,
+                breathing_data,
+                prev_hr,
+                harmonic_penalty_close,
+                harmonic_penalty_far,
+                harmonic_close_threshold,
+                harmonic_far_threshold,
+            );
 
             peaks.push((bpm, magnitude * harmonic_factor));
         }
@@ -545,20 +570,20 @@ pub fn analyze_heart_rate_fft(
             }
 
             // Check if this is an outlier compared to recent history
-            let recent_rates = history.get_recent_rates(60);
+            let recent_rates = history.get_recent_rates(hr_history_window);
             let is_valid = if !recent_rates.is_empty() {
                 let mut sorted_rates = recent_rates;
                 sorted_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-                let lower_idx = (sorted_rates.len() as f32 * 0.02) as usize;
-                let upper_idx = (sorted_rates.len() as f32 * 0.98) as usize;
+                let lower_idx = (sorted_rates.len() as f32 * hr_outlier_percentile) as usize;
+                let upper_idx = (sorted_rates.len() as f32 * (1.0 - hr_outlier_percentile)) as usize;
                 let mut lower_bound = sorted_rates[lower_idx];
                 let mut upper_bound = sorted_rates[upper_idx];
 
                 if (upper_bound - lower_bound) < 25.0 {
                     let mean: f32 = sorted_rates.iter().sum::<f32>() / sorted_rates.len() as f32;
-                    lower_bound = mean - 12.5;
-                    upper_bound = mean + 12.5;
+                    lower_bound = mean - 10.0;
+                    upper_bound = mean + 10.0;
                 }
 
                 debug!(
@@ -655,6 +680,7 @@ pub fn interpolate_and_smooth(
     timestamps: &[DateTime<Utc>],
     values: &[(DateTime<Utc>, f32)],
     window_size: usize,
+    smoothing_strength: f32,
 ) -> Vec<(DateTime<Utc>, f32)> {
     if values.is_empty() || timestamps.is_empty() {
         return Vec::new();
@@ -705,7 +731,8 @@ pub fn interpolate_and_smooth(
         let mut weighted_sum = 0.0;
         let mut weight_sum = 0.0;
 
-        let sigma = (window.len() as f32) / 4.0; // Controls how quickly weights fall off
+        // Invert the smoothing strength (higher value = more smoothing)
+        let sigma = (window.len() as f32) * smoothing_strength;
         let center = window.len() as f32 / 2.0;
 
         for (j, &(_, value)) in window.iter().enumerate() {
