@@ -364,15 +364,15 @@ fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
 
     // Calculate range with smaller buffer
     let min_hr = (prev_hr - downward_change - 3.0).max(35.0);
-    let max_hr = (prev_hr + upward_change + 3.0).min(85.0);
+    let max_hr = (prev_hr + upward_change + 3.0).min(90.0);
 
     // Less aggressive HR zone restrictions
-    let max_hr = if prev_hr < 70.0 {
+    let max_hr = if prev_hr < 65.0 {
         // Low HR zone - allow more upward movement
         (prev_hr + upward_change * 0.8).min(80.0)
     } else if prev_hr < 75.0 {
         // Medium HR zone
-        (prev_hr + upward_change * 0.9).min(85.0)
+        (prev_hr + upward_change * 0.9).min(95.0)
     } else {
         // High HR zone
         max_hr

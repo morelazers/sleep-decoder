@@ -893,6 +893,10 @@ fn write_analysis_to_csv(
 ) -> Result<()> {
     let path = std::path::Path::new(base_path);
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
+
+    // Create directory if it doesn't exist
+    std::fs::create_dir_all(dir)?;
+
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1167,7 +1171,7 @@ fn read_csv_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
     Ok(data)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     // Initialize logger
     env_logger::init();
 
@@ -1212,7 +1216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if file_index.is_empty() {
             println!("No RAW files found");
-            return Ok(());
+            return Err(anyhow::anyhow!("No RAW files found in directory: {}", args.input_path.display()));
         }
 
         // Only filter files by time range if provided
