@@ -10,6 +10,8 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use arrow::array::{Array, StringArray, ListArray, Int32Array};
+use arrow::ipc::reader::FileReaderBuilder;
 
 mod phase_analysis;
 
@@ -24,6 +26,10 @@ struct Args {
     /// Whether the input is a CSV file
     #[arg(long)]
     csv_input: bool,
+
+    /// Whether the input is a Feather file
+    #[arg(long)]
+    feather_input: bool,
 
     /// Start time (format: YYYY-MM-DD HH:MM), defaults to 24 hours ago
     #[arg(long, env = "ANALYSIS_START_TIME")]
@@ -1171,7 +1177,66 @@ fn read_csv_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
     Ok(data)
 }
 
-fn main() -> Result<()> {
+// Add new function to read Feather data
+fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
+    let file = File::open(path)?;
+    let reader = FileReaderBuilder::new().build(file)?;
+    let mut data = Vec::new();
+    let mut seq = 0;
+
+    for batch in reader {
+        let batch = batch?;
+
+        // Get column arrays
+        let type_col = batch.column_by_name("type").expect("type column missing")
+            .as_any().downcast_ref::<StringArray>().expect("type column should be strings");
+        let ts_col = batch.column_by_name("ts").expect("ts column missing")
+            .as_any().downcast_ref::<StringArray>().expect("ts column should be strings");
+        let left1_col = batch.column_by_name("left1").expect("left1 column missing")
+            .as_any().downcast_ref::<ListArray>().expect("left1 column should be a list");
+        let right1_col = batch.column_by_name("right1").expect("right1 column missing")
+            .as_any().downcast_ref::<ListArray>().expect("right1 column should be a list");
+
+        // Process each row
+        for row in 0..batch.num_rows() {
+            // Only process piezo-dual records
+            if type_col.value(row) == "piezo-dual" {
+                // Parse timestamp from string
+                let ts = NaiveDateTime::parse_from_str(ts_col.value(row), "%Y-%m-%d %H:%M:%S")?
+                    .timestamp();
+
+                // Get left and right signals as i32 arrays
+                let left_values = left1_col.value(row);
+                let right_values = right1_col.value(row);
+
+                let left = left_values.as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("left values should be i32")
+                    .values()
+                    .to_vec();
+
+                let right = right_values.as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("right values should be i32")
+                    .values()
+                    .to_vec();
+
+                let combined = CombinedSensorData {
+                    ts,
+                    left,
+                    right,
+                };
+
+                data.push((seq, combined));
+                seq += 1;
+            }
+        }
+    }
+
+    Ok(data)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logger
     env_logger::init();
 
@@ -1210,13 +1275,27 @@ fn main() -> Result<()> {
             });
         }
         data
+    } else if args.feather_input {
+        println!("Reading from Feather file: {}", args.input_path.display());
+        let mut data = read_feather_file(&args.input_path)?;
+
+        println!("Loaded {} rows from Feather file", data.len());
+
+        // Only filter by time range if provided
+        if let (Some(start), Some(end)) = (start_time, end_time) {
+            data.retain(|(_, combined)| {
+                let timestamp = DateTime::from_timestamp(combined.ts, 0).unwrap();
+                timestamp >= start && timestamp <= end
+            });
+        }
+        data
     } else {
         println!("Building RAW file index...");
         let file_index = build_raw_file_index(&args.input_path)?;
 
         if file_index.is_empty() {
             println!("No RAW files found");
-            return Err(anyhow::anyhow!("No RAW files found in directory: {}", args.input_path.display()));
+            return Ok(());
         }
 
         // Only filter files by time range if provided
