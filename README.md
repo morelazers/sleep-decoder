@@ -51,6 +51,7 @@ cargo run --release /path/to/raws [OPTIONS]
 ```bash
 cargo run --release /path/to/raws \                # Input directory with RAW files
   --csv-input \                                    # Use if input is a CSV file
+  --feather-input \                                # Use if input is a Feather file
   --start-time="2025-01-01 22:00" \                # UTC!
   --end-time="2025-01-02 09:00" \                  # UTC!
   --csv-output=/path/to/output/dir/somename \      # Output file prefix
