@@ -274,7 +274,7 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
     for batch in reader {
         let batch = batch?;
 
-        // Get column arrays
+        // Get required column arrays
         let type_col = batch
             .column_by_name("type")
             .expect("type column missing")
@@ -293,24 +293,20 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("left1 column should be a list");
-        let left2_col = batch
-            .column_by_name("left2")
-            .expect("left2 column missing")
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("left2 column should be a list");
         let right1_col = batch
             .column_by_name("right1")
             .expect("right1 column missing")
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("right1 column should be a list");
+
+        // Get optional column arrays
+        let left2_col = batch
+            .column_by_name("left2")
+            .and_then(|col| col.as_any().downcast_ref::<ListArray>());
         let right2_col = batch
             .column_by_name("right2")
-            .expect("right2 column missing")
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("right2 column should be a list");
+            .and_then(|col| col.as_any().downcast_ref::<ListArray>());
 
         // Process each row
         for row in 0..batch.num_rows() {
@@ -321,56 +317,68 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
                     .and_utc()
                     .timestamp();
 
-                // Get left and right signals as i32 arrays
+                // Get required signals as i32 arrays
                 let left1_values = left1_col.value(row);
                 let right1_values = right1_col.value(row);
-                let left2_values = left2_col.value(row);
-                let right2_values = right2_col.value(row);
 
                 let left1 = left1_values
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .expect("left values should be i32")
-                    .values()
-                    .to_vec();
-
-                let left2 = left2_values
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("left2 values should be i32")
+                    .expect("left1 values should be i32")
                     .values()
                     .to_vec();
 
                 let right1 = right1_values
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .expect("right values should be i32")
+                    .expect("right1 values should be i32")
                     .values()
                     .to_vec();
 
-                let right2 = right2_values
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("right2 values should be i32")
-                    .values()
-                    .to_vec();
+                // Get optional signals if available
+                let left2 = left2_col.and_then(|col| {
+                    col.value(row)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .map(|arr| arr.values().to_vec())
+                });
+
+                let right2 = right2_col.and_then(|col| {
+                    col.value(row)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .map(|arr| arr.values().to_vec())
+                });
+
+                // Calculate combined signals
+                let left = if let Some(left2_data) = &left2 {
+                    left1
+                        .iter()
+                        .zip(left2_data.iter())
+                        .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+                        .collect()
+                } else {
+                    left1.clone()
+                };
+
+                let right = if let Some(right2_data) = &right2 {
+                    right1
+                        .iter()
+                        .zip(right2_data.iter())
+                        .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
+                        .collect()
+                } else {
+                    right1.clone()
+                };
 
                 let combined = CombinedSensorData {
                     ts,
                     left1: left1.clone(),
-                    left2: Some(left2.clone()),
+                    left2,
                     right1: right1.clone(),
-                    right2: Some(right2.clone()),
-                    left: left1
-                        .iter()
-                        .zip(left2.iter())
-                        .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-                        .collect(),
-                    right: right1
-                        .iter()
-                        .zip(right2.iter())
-                        .map(|(a, b)| ((*a as i64 + *b as i64) / 2) as i32)
-                        .collect(),
+                    right2,
+                    left,
+                    right,
                 };
 
                 data.push((seq, combined));
