@@ -1,129 +1,20 @@
-use crate::phase_analysis::SleepPhase;
-use anyhow::{Context, Result};
-use arrow::array::{Array, Int32Array, ListArray, StringArray};
-use arrow::ipc::reader::FileReaderBuilder;
+use anyhow::Result;
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use env_logger;
-use serde::{Deserialize, Serialize};
-use serde_bytes;
-use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
-
-mod data_loading;
-mod phase_analysis;
-
-use data_loading::{
-    build_raw_file_index, decode_batch_item, read_csv_file, read_feather_file, CombinedSensorData,
+use serde::Deserialize;
+use sleep_decoder::{
+    config::{Args, SensorSelection},
+    data_loading::{
+        build_raw_file_index, decode_batch_item, read_csv_file, read_feather_file,
+        CombinedSensorData,
+    },
+    heart_analysis, output,
+    phase_analysis::{self},
+    preprocessing::{self, ProcessedData},
+    BedAnalysis, BedPresence, PeriodAnalysis, RawDataView, SideAnalysis,
 };
-
-#[derive(Debug, Clone, Copy)]
-pub enum SensorSelection {
-    Combined, // 0: Use combined sensors (default)
-    First,    // 1: Use left1/right1
-    Second,   // 2: Use left2/right2
-}
-
-impl std::str::FromStr for SensorSelection {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "0" => Ok(SensorSelection::Combined),
-            "1" => Ok(SensorSelection::First),
-            "2" => Ok(SensorSelection::Second),
-            _ => Err(format!("Invalid sensor selection: {}. Use 0 for combined sensors (default), 1 for first sensors (left1/right1), or 2 for second sensors (left2/right2)", s)),
-        }
-    }
-}
-
-/// Process sleep data from RAW files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Directory containing .RAW files or path to input CSV
-    #[arg(help = "Directory containing .RAW files or path to input CSV")]
-    input_path: PathBuf,
-
-    /// Whether the input is a CSV file
-    #[arg(long)]
-    csv_input: bool,
-
-    /// Whether the input is a Feather file
-    #[arg(long)]
-    feather_input: bool,
-
-    /// Select sensor for analysis (0=combined [default], 1=first sensors, 2=second sensors)
-    #[arg(long)]
-    sensor: Option<SensorSelection>,
-
-    /// Start time (format: YYYY-MM-DD HH:MM), defaults to 24 hours ago
-    #[arg(long)]
-    start_time: Option<String>,
-
-    /// End time (format: YYYY-MM-DD HH:MM), defaults to now
-    #[arg(long)]
-    end_time: Option<String>,
-
-    /// CSV output file prefix (e.g. /path/to/output/prefix)
-    #[arg(long)]
-    csv_output: Option<String>,
-
-    /// Window size for smoothing HR results
-    #[arg(long, default_value = "60")]
-    hr_smoothing_window: usize,
-
-    /// Heart rate window size in seconds
-    #[arg(long, default_value = "10.0")]
-    hr_window_seconds: f32,
-
-    /// Heart rate window overlap percentage (0.0 to 1.0)
-    #[arg(long, default_value = "0.1")]
-    hr_window_overlap: f32,
-
-    /// Breathing rate window size in seconds
-    #[arg(long, default_value = "120.0")]
-    br_window_seconds: f32,
-
-    /// Breathing rate window overlap percentage (0.0 to 1.0)
-    #[arg(long, default_value = "0.0")]
-    br_window_overlap: f32,
-
-    /// Merge left and right signals for analysis
-    #[arg(long)]
-    merge_sides: bool,
-
-    /// Percentile threshold for HR outlier detection (0.0 to 0.5, default 0.05 means using 5th and 95th percentiles)
-    #[arg(long, default_value = "0.05")]
-    hr_outlier_percentile: f32,
-
-    /// Number of recent heart rate measurements to consider for outlier detection
-    #[arg(long, default_value = "60")]
-    hr_history_window: usize,
-
-    /// Base penalty for breathing harmonics when close to previous HR (0.0 to 1.0)
-    #[arg(long, default_value = "0.8")]
-    harmonic_penalty_close: f32,
-
-    /// Base penalty for breathing harmonics when far from previous HR (0.0 to 1.0)
-    #[arg(long, default_value = "0.5")]
-    harmonic_penalty_far: f32,
-
-    /// BPM difference threshold for "close" harmonic penalty (in BPM)
-    #[arg(long, default_value = "5.0")]
-    harmonic_close_threshold: f32,
-
-    /// BPM difference threshold for "far" harmonic penalty (in BPM)
-    #[arg(long, default_value = "10.0")]
-    harmonic_far_threshold: f32,
-
-    /// Smoothing strength for heart rate data (0.1 to 2.0, higher = more smoothing, default 0.25)
-    #[arg(long, default_value = "0.25")]
-    hr_smoothing_strength: f32,
-}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -133,318 +24,6 @@ struct BedTempSide {
     cen: f32,
     #[serde(rename = "in")]
     _in: f32,
-}
-
-#[derive(Debug, Serialize, Copy, Clone)]
-struct ProcessedData {
-    timestamp: DateTime<Utc>,
-    left1_mean: f32,
-    left1_std: f32,
-    left2_mean: f32,
-    left2_std: f32,
-    right1_mean: f32,
-    right1_std: f32,
-    right2_mean: f32,
-    right2_std: f32,
-}
-
-#[derive(Debug, Clone)]
-struct BedPresence {
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    confidence: f32,
-}
-
-#[derive(Debug)]
-struct PeriodAnalysis {
-    fft_heart_rates: Vec<(DateTime<Utc>, f32)>, // Results from FFT analysis
-    breathing_rates: Vec<(DateTime<Utc>, f32)>, // Results from breathing analysis
-}
-
-#[derive(Debug)]
-struct SideAnalysis {
-    combined: PeriodAnalysis,
-    period_num: usize,
-    sleep_phases: Vec<(DateTime<Utc>, SleepPhase)>,
-}
-
-#[derive(Debug)]
-struct BedAnalysis {
-    left_side: Vec<SideAnalysis>,
-    right_side: Vec<SideAnalysis>,
-}
-
-pub struct RawDataView<'a> {
-    raw_data: &'a [(u32, CombinedSensorData)],
-    start_idx: usize,
-    end_idx: usize,
-}
-
-#[derive(Debug)]
-pub struct RawPeriodData<'a> {
-    pub timestamp: DateTime<Utc>,
-    pub left1: &'a [i32],
-    pub left2: Option<&'a [i32]>,
-    pub right1: &'a [i32],
-    pub right2: Option<&'a [i32]>,
-    pub left: &'a [i32],
-    pub right: &'a [i32],
-}
-
-impl<'a> RawDataView<'a> {
-    pub fn get_data_at(&self, idx: usize) -> Option<RawPeriodData<'a>> {
-        if idx >= self.end_idx - self.start_idx {
-            return None;
-        }
-
-        let data = &self.raw_data[self.start_idx + idx].1;
-        Some(RawPeriodData {
-            timestamp: DateTime::from_timestamp(data.ts, 0).unwrap(),
-            left1: &data.left1,
-            left2: data.left2.as_deref(),
-            right1: &data.right1,
-            right2: data.right2.as_deref(),
-            left: &data.left,
-            right: &data.right,
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.end_idx - self.start_idx
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-fn create_raw_data_view<'a>(
-    raw_sensor_data: &'a [(u32, CombinedSensorData)],
-    period: &'_ BedPresence,
-) -> RawDataView<'a> {
-    let start_idx = raw_sensor_data
-        .partition_point(|(_, data)| DateTime::from_timestamp(data.ts, 0).unwrap() < period.start);
-
-    let end_idx = start_idx
-        + raw_sensor_data[start_idx..].partition_point(|(_, data)| {
-            DateTime::from_timestamp(data.ts, 0).unwrap() <= period.end
-        });
-
-    RawDataView {
-        raw_data: raw_sensor_data,
-        start_idx,
-        end_idx,
-    }
-}
-
-fn calculate_stats(data: &[i32]) -> (f32, f32) {
-    // First remove outliers from raw data
-    let cleaned_data = heart_analysis::interpolate_outliers(data, 2);
-
-    let n = cleaned_data.len() as f32;
-    if n == 0.0 {
-        return (0.0, 0.0);
-    }
-
-    let mean = cleaned_data.iter().sum::<f32>() / n;
-    let variance = cleaned_data
-        .iter()
-        .map(|&x| {
-            let diff = x - mean;
-            diff * diff
-        })
-        .sum::<f32>()
-        / n;
-
-    let std_dev = variance.sqrt();
-
-    // Round to 2 decimal places like Python
-    (
-        (mean * 100.0).round() / 100.0,
-        (std_dev * 100.0).round() / 100.0,
-    )
-}
-
-fn process_piezo_data(data: &CombinedSensorData) -> Option<ProcessedData> {
-    let timestamp = DateTime::from_timestamp(data.ts, 0).unwrap();
-
-    // Calculate stats for combined signals
-    let (left_mean, left_std) = calculate_stats(&data.left);
-    let (right_mean, right_std) = calculate_stats(&data.right);
-
-    Some(ProcessedData {
-        timestamp,
-        left1_mean: left_mean,
-        left1_std: left_std,
-        left2_mean: left_mean, // Use same values since signals are combined
-        left2_std: left_std,
-        right1_mean: right_mean,
-        right1_std: right_std,
-        right2_mean: right_mean, // Use same values since signals are combined
-        right2_std: right_std,
-    })
-}
-
-fn remove_stat_outliers_for_sensor(data: &mut Vec<ProcessedData>, sensor: &str) {
-    // First collect the values we need
-    let (mean_data, std_data): (Vec<f32>, Vec<f32>) = match sensor {
-        "left1" => data.iter().map(|d| (d.left1_mean, d.left1_std)).unzip(),
-        "left2" => data.iter().map(|d| (d.left2_mean, d.left2_std)).unzip(),
-        "right1" => data.iter().map(|d| (d.right1_mean, d.right1_std)).unzip(),
-        "right2" => data.iter().map(|d| (d.right2_mean, d.right2_std)).unzip(),
-        _ => unreachable!(),
-    };
-
-    let len_before = data.len();
-
-    // Calculate percentiles for mean
-    let mean_percentiles = {
-        let mut indices: Vec<usize> = (0..mean_data.len()).collect();
-        indices.sort_by(|&a, &b| mean_data[a].partial_cmp(&mean_data[b]).unwrap());
-        let mean_lower = mean_data[indices[(data.len() as f32 * 0.02) as usize]];
-        let mean_upper = mean_data[indices[(data.len() as f32 * 0.98) as usize]];
-        (mean_lower, mean_upper)
-    };
-
-    // Calculate percentiles for std
-    let std_percentiles = {
-        let mut indices: Vec<usize> = (0..std_data.len()).collect();
-        indices.sort_by(|&a, &b| std_data[a].partial_cmp(&std_data[b]).unwrap());
-        let std_lower = std_data[indices[(data.len() as f32 * 0.02) as usize]];
-        let std_upper = std_data[indices[(data.len() as f32 * 0.98) as usize]];
-        (std_lower, std_upper)
-    };
-
-    // Filter data
-    data.retain(|d| {
-        let (mean, std) = match sensor {
-            "left1" => (d.left1_mean, d.left1_std),
-            "left2" => (d.left2_mean, d.left2_std),
-            "right1" => (d.right1_mean, d.right1_std),
-            "right2" => (d.right2_mean, d.right2_std),
-            _ => unreachable!(),
-        };
-        mean >= mean_percentiles.0
-            && mean <= mean_percentiles.1
-            && std >= std_percentiles.0
-            && std <= std_percentiles.1
-    });
-
-    println!(
-        "Removed {} rows as mean/std outliers for {}",
-        len_before - data.len(),
-        sensor
-    );
-    println!("Remaining rows: {}", data.len());
-}
-
-fn remove_stat_outliers(data: &mut Vec<ProcessedData>) {
-    // Process each sensor independently
-    for sensor in ["left1", "left2", "right1", "right2"] {
-        remove_stat_outliers_for_sensor(data, sensor);
-    }
-}
-
-fn remove_time_outliers(data: &mut Vec<ProcessedData>) {
-    if data.is_empty() {
-        return;
-    }
-
-    // Convert timestamps to i64 for calculations
-    let timestamps: Vec<i64> = data.iter().map(|d| d.timestamp.timestamp()).collect();
-
-    // Sort for percentile calculation
-    let mut sorted = timestamps.clone();
-    sorted.sort();
-
-    // Calculate 1st and 99th percentiles like Python
-    let lower_idx = (timestamps.len() as f32 * 0.01) as usize;
-    let upper_idx = (timestamps.len() as f32 * 0.99) as usize;
-    let lower_bound = sorted[lower_idx];
-    let upper_bound = sorted[upper_idx];
-
-    let len_before = data.len();
-    data.retain(|d| {
-        let ts = d.timestamp.timestamp();
-        ts >= lower_bound && ts <= upper_bound
-    });
-
-    println!("Removed {} rows as date outliers", len_before - data.len());
-    println!("Remaining rows: {}", data.len());
-}
-
-fn scale_data(data: &mut Vec<ProcessedData>) {
-    // Helper functions remain the same
-    fn median(values: &[f32]) -> f32 {
-        let mut sorted = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mid = sorted.len() / 2;
-        if sorted.len() % 2 == 0 {
-            (sorted[mid - 1] + sorted[mid]) / 2.0
-        } else {
-            sorted[mid]
-        }
-    }
-
-    fn quartiles(values: &[f32]) -> (f32, f32) {
-        let mut sorted = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let q1_pos = (sorted.len() as f32 * 0.25) as usize;
-        let q3_pos = (sorted.len() as f32 * 0.75) as usize;
-        (sorted[q1_pos], sorted[q3_pos])
-    }
-
-    // Scale each field individually
-    let fields = [
-        "left1_mean",
-        "left2_mean",
-        "right1_mean",
-        "right2_mean",
-        "left1_std",
-        "left2_std",
-        "right1_std",
-        "right2_std",
-    ];
-
-    for field in fields.iter() {
-        // Get values for this field
-        let values: Vec<f32> = match *field {
-            "left1_mean" => data.iter().map(|d| d.left1_mean).collect(),
-            "left2_mean" => data.iter().map(|d| d.left2_mean).collect(),
-            "right1_mean" => data.iter().map(|d| d.right1_mean).collect(),
-            "right2_mean" => data.iter().map(|d| d.right2_mean).collect(),
-            "left1_std" => data.iter().map(|d| d.left1_std).collect(),
-            "left2_std" => data.iter().map(|d| d.left2_std).collect(),
-            "right1_std" => data.iter().map(|d| d.right1_std).collect(),
-            "right2_std" => data.iter().map(|d| d.right2_std).collect(),
-            _ => unreachable!(),
-        };
-
-        let center = median(&values);
-        let (q1, q3) = quartiles(&values);
-        let iqr = q3 - q1;
-
-        // Apply scaling - just like RobustScaler
-        for d in data.iter_mut() {
-            let value = match *field {
-                "left1_mean" => &mut d.left1_mean,
-                "left2_mean" => &mut d.left2_mean,
-                "right1_mean" => &mut d.right1_mean,
-                "right2_mean" => &mut d.right2_mean,
-                "left1_std" => &mut d.left1_std,
-                "left2_std" => &mut d.left2_std,
-                "right1_std" => &mut d.right1_std,
-                "right2_std" => &mut d.right2_std,
-                _ => unreachable!(),
-            };
-
-            *value = if iqr != 0.0 {
-                (*value - center) / iqr // This is the key change - matches RobustScaler
-            } else {
-                *value - center
-            };
-        }
-    }
 }
 
 fn detect_bed_presence(data: &[ProcessedData], side: &str) -> Vec<BedPresence> {
@@ -581,8 +160,6 @@ fn extract_raw_data_for_period<'a>(
 ) -> RawDataView<'a> {
     create_raw_data_view(raw_sensor_data, period)
 }
-
-mod heart_analysis;
 
 fn analyse_sensor_data(
     signal: &[i32],
@@ -871,114 +448,28 @@ fn analyze_bed_presence_periods(
     Ok(bed_analysis)
 }
 
-fn write_analysis_to_csv(
-    base_path: &str,
-    sensor_id: &str,
-    period_num: usize,
-    analysis: &PeriodAnalysis,
-    hr_smoothing_window: usize,
-    hr_smoothing_strength: f32,
-    sleep_phases: &[(DateTime<Utc>, SleepPhase)],
-) -> Result<()> {
-    let path = std::path::Path::new(base_path);
-    let dir = path.parent().unwrap_or(std::path::Path::new("."));
-
-    // Create directory if it doesn't exist
-    std::fs::create_dir_all(dir)?;
-
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("results");
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("csv");
-
-    let filename = format!("{}_{}_period_{}.{}", stem, sensor_id, period_num, ext);
-    let full_path = dir.join(filename);
-
-    println!("Writing results to {}", full_path.display());
-    let file = std::fs::File::create(full_path)?;
-    let mut writer = csv::Writer::from_writer(file);
-
-    // Collect all timestamps
-    let mut timestamps: Vec<DateTime<Utc>> = Vec::new();
-    timestamps.extend(analysis.fft_heart_rates.iter().map(|(t, _)| *t));
-    timestamps.extend(analysis.breathing_rates.iter().map(|(t, _)| *t));
-    timestamps.extend(sleep_phases.iter().map(|(t, _)| *t));
-    timestamps.sort_unstable();
-    timestamps.dedup();
-
-    // Interpolate and smooth heart rates
-    let smoothed_fft_hr = heart_analysis::interpolate_and_smooth(
-        &timestamps,
-        &analysis.fft_heart_rates,
-        hr_smoothing_window,
-        hr_smoothing_strength,
-    );
-
-    // Write header
-    writer.write_record(&[
-        "timestamp",
-        "fft_hr",
-        "fft_hr_smoothed",
-        "breathing_rate",
-        "sleep_phase",
-    ])?;
-
-    // Write data for each timestamp
-    for &timestamp in &timestamps {
-        let fft_hr = analysis
-            .fft_heart_rates
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, hr)| hr.to_string())
-            .unwrap_or_default();
-
-        let fft_hr_smoothed = smoothed_fft_hr
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, hr)| hr.to_string())
-            .unwrap_or_default();
-
-        let br = analysis
-            .breathing_rates
-            .iter()
-            .find(|(t, _)| *t == timestamp)
-            .map(|(_, br)| br.to_string())
-            .unwrap_or_default();
-
-        // Find the current sleep phase
-        let phase = sleep_phases
-            .iter()
-            .rev()
-            .find(|(t, _)| *t <= timestamp)
-            .map(|(_, phase)| format!("{:?}", phase))
-            .unwrap_or_default();
-
-        writer.write_record(&[
-            timestamp.format("%Y-%m-%d %H:%M").to_string(),
-            fft_hr,
-            fft_hr_smoothed,
-            br,
-            phase,
-        ])?;
-    }
-
-    writer.flush()?;
-    Ok(())
-}
-
 fn parse_datetime(datetime_str: &str) -> Result<DateTime<Utc>> {
     let naive = NaiveDateTime::parse_from_str(datetime_str, "%Y-%m-%d %H:%M")?;
     Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
-#[derive(Debug)]
-struct RawFileInfo {
-    path: PathBuf,
-    first_seq: u32,
-    last_seq: u32,
-    start_time: DateTime<Utc>,
-    end_time: DateTime<Utc>,
+fn create_raw_data_view<'a>(
+    raw_sensor_data: &'a [(u32, CombinedSensorData)],
+    period: &'_ BedPresence,
+) -> RawDataView<'a> {
+    let start_idx = raw_sensor_data
+        .partition_point(|(_, data)| DateTime::from_timestamp(data.ts, 0).unwrap() < period.start);
+
+    let end_idx = start_idx
+        + raw_sensor_data[start_idx..].partition_point(|(_, data)| {
+            DateTime::from_timestamp(data.ts, 0).unwrap() <= period.end
+        });
+
+    RawDataView {
+        raw_data: raw_sensor_data,
+        start_idx,
+        end_idx,
+    }
 }
 
 fn main() -> Result<()> {
@@ -1089,16 +580,16 @@ fn main() -> Result<()> {
     // Process all sensor data at once
     let mut all_processed_data: Vec<ProcessedData> = raw_sensor_data
         .iter()
-        .map(|(_, data)| process_piezo_data(data))
+        .map(|(_, data)| preprocessing::process_piezo_data(data))
         .flatten()
         .collect();
 
     // First remove time outliers
-    remove_time_outliers(&mut all_processed_data);
+    preprocessing::remove_time_outliers(&mut all_processed_data);
 
     // Then remove stat outliers
     let len_before = all_processed_data.len();
-    remove_stat_outliers(&mut all_processed_data);
+    preprocessing::remove_stat_outliers(&mut all_processed_data);
 
     println!(
         "Removed {} rows as mean/std outliers",
@@ -1108,7 +599,7 @@ fn main() -> Result<()> {
     println!("Total processed entries: {}", all_processed_data.len());
 
     // Scale the data
-    scale_data(&mut all_processed_data);
+    preprocessing::scale_data(&mut all_processed_data);
 
     // Determine bed presence periods based on whether time window is specified
     let (left_periods, right_periods) = if let (Some(start), Some(end)) = (start_time, end_time) {
@@ -1140,7 +631,7 @@ fn main() -> Result<()> {
     // Write CSV files if output prefix was provided
     if let Some(prefix) = &args.csv_output {
         for analysis in &bed_analysis.left_side {
-            write_analysis_to_csv(
+            output::write_analysis_to_csv(
                 prefix,
                 "left_combined",
                 analysis.period_num,
@@ -1152,7 +643,7 @@ fn main() -> Result<()> {
         }
 
         for analysis in &bed_analysis.right_side {
-            write_analysis_to_csv(
+            output::write_analysis_to_csv(
                 prefix,
                 "right_combined",
                 analysis.period_num,

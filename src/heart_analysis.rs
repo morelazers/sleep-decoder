@@ -1,12 +1,10 @@
-use super::RawDataView;
+use crate::RawDataView;
 use chrono::{DateTime, Duration, Utc};
 use log::debug;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use sci_rs::signal::filter::{design::Sos, sosfiltfilt_dyn};
 use std::f32::consts::PI;
 use std::sync::Arc;
-use std::error::Error;
-use csv;
 
 /// A window of signal data with its metadata
 pub struct SignalWindow {
@@ -576,7 +574,8 @@ pub fn analyze_heart_rate_fft(
                 sorted_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
                 let lower_idx = (sorted_rates.len() as f32 * hr_outlier_percentile) as usize;
-                let upper_idx = (sorted_rates.len() as f32 * (1.0 - hr_outlier_percentile)) as usize;
+                let upper_idx =
+                    (sorted_rates.len() as f32 * (1.0 - hr_outlier_percentile)) as usize;
                 let mut lower_bound = sorted_rates[lower_idx];
                 let mut upper_bound = sorted_rates[upper_idx];
 

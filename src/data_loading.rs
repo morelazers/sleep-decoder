@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use arrow::array::{Array, Int32Array, ListArray, StringArray};
 use arrow::ipc::reader::FileReaderBuilder;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_bytes;
 use std::fs::File;
 use std::io::BufReader;
@@ -50,69 +50,65 @@ pub struct CombinedSensorData {
 
 impl<'a> From<&'a SensorData> for Option<CombinedSensorData> {
     fn from(data: &'a SensorData) -> Option<CombinedSensorData> {
-        if let SensorData::PiezoDual {
+        let SensorData::PiezoDual {
             ts,
             left1,
             left2,
             right1,
             right2,
             ..
-        } = data
-        {
-            // Convert individual sensors
-            let left1_vec: Vec<i32> = left1
-                .chunks_exact(4)
+        } = data;
+        // Convert individual sensors
+        let left1_vec: Vec<i32> = left1
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        let left2_vec: Option<Vec<i32>> = left2.as_ref().map(|data| {
+            data.chunks_exact(4)
                 .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
+                .collect()
+        });
 
-            let left2_vec: Option<Vec<i32>> = left2.as_ref().map(|data| {
-                data.chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
-            });
+        let right1_vec: Vec<i32> = right1
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
 
-            let right1_vec: Vec<i32> = right1
-                .chunks_exact(4)
+        let right2_vec: Option<Vec<i32>> = right2.as_ref().map(|data| {
+            data.chunks_exact(4)
                 .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
+                .collect()
+        });
 
-            let right2_vec: Option<Vec<i32>> = right2.as_ref().map(|data| {
-                data.chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
-            });
+        // Compute combined signals
+        let left = match &left2_vec {
+            Some(left2_data) => left1_vec
+                .iter()
+                .zip(left2_data.iter())
+                .map(|(a, b)| (((*a as i64 + *b as i64) / 2) as i32))
+                .collect(),
+            None => left1_vec.clone(),
+        };
 
-            // Compute combined signals
-            let left = match &left2_vec {
-                Some(left2_data) => left1_vec
-                    .iter()
-                    .zip(left2_data.iter())
-                    .map(|(a, b)| (((*a as i64 + *b as i64) / 2) as i32))
-                    .collect(),
-                None => left1_vec.clone(),
-            };
+        let right = match &right2_vec {
+            Some(right2_data) => right1_vec
+                .iter()
+                .zip(right2_data.iter())
+                .map(|(a, b)| (((*a as i64 + *b as i64) / 2) as i32))
+                .collect(),
+            None => right1_vec.clone(),
+        };
 
-            let right = match &right2_vec {
-                Some(right2_data) => right1_vec
-                    .iter()
-                    .zip(right2_data.iter())
-                    .map(|(a, b)| (((*a as i64 + *b as i64) / 2) as i32))
-                    .collect(),
-                None => right1_vec.clone(),
-            };
-
-            Some(CombinedSensorData {
-                ts: *ts,
-                left1: left1_vec,
-                left2: left2_vec,
-                right1: right1_vec,
-                right2: right2_vec,
-                left,
-                right,
-            })
-        } else {
-            None
-        }
+        Some(CombinedSensorData {
+            ts: *ts,
+            left1: left1_vec,
+            left2: left2_vec,
+            right1: right1_vec,
+            right2: right2_vec,
+            left,
+            right,
+        })
     }
 }
 
@@ -183,14 +179,13 @@ pub fn build_raw_file_index(raw_dir: &PathBuf) -> Result<Vec<RawFileInfo>> {
             let mut end_time = DateTime::<Utc>::MIN_UTC;
 
             for (seq, data) in &items {
-                if let SensorData::PiezoDual { ts, .. } = data {
-                    first_seq = first_seq.min(*seq);
-                    last_seq = last_seq.max(*seq);
+                let SensorData::PiezoDual { ts, .. } = data;
+                first_seq = first_seq.min(*seq);
+                last_seq = last_seq.max(*seq);
 
-                    let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
-                    start_time = start_time.min(timestamp);
-                    end_time = end_time.max(timestamp);
-                }
+                let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
+                start_time = start_time.min(timestamp);
+                end_time = end_time.max(timestamp);
             }
 
             file_index.push(RawFileInfo {
@@ -233,7 +228,7 @@ pub fn read_csv_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
 
         // Parse the timestamp from datetime string
         let dt = NaiveDateTime::parse_from_str(record.get(1).unwrap(), "%Y-%m-%d %H:%M:%S")?;
-        let ts = dt.timestamp();
+        let ts = dt.and_utc().timestamp();
 
         // Parse left1 and right1 as space-separated integers
         let parse_signal = |s: &str| -> Result<Vec<i32>> {
@@ -323,6 +318,7 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
             if type_col.value(row) == "piezo-dual" {
                 // Parse timestamp from string
                 let ts = NaiveDateTime::parse_from_str(ts_col.value(row), "%Y-%m-%d %H:%M:%S")?
+                    .and_utc()
                     .timestamp();
 
                 // Get left and right signals as i32 arrays
