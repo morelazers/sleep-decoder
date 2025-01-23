@@ -1,5 +1,7 @@
 use crate::phase_analysis::SleepPhase;
 use anyhow::{Context, Result};
+use arrow::array::{Array, Int32Array, ListArray, StringArray};
+use arrow::ipc::reader::FileReaderBuilder;
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -10,10 +12,33 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
-use arrow::array::{Array, StringArray, ListArray, Int32Array};
-use arrow::ipc::reader::FileReaderBuilder;
 
+mod data_loading;
 mod phase_analysis;
+
+use data_loading::{
+    build_raw_file_index, decode_batch_item, read_csv_file, read_feather_file, CombinedSensorData,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub enum SensorSelection {
+    Combined, // 0: Use combined sensors (default)
+    First,    // 1: Use left1/right1
+    Second,   // 2: Use left2/right2
+}
+
+impl std::str::FromStr for SensorSelection {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "0" => Ok(SensorSelection::Combined),
+            "1" => Ok(SensorSelection::First),
+            "2" => Ok(SensorSelection::Second),
+            _ => Err(format!("Invalid sensor selection: {}. Use 0 for combined sensors (default), 1 for first sensors (left1/right1), or 2 for second sensors (left2/right2)", s)),
+        }
+    }
+}
 
 /// Process sleep data from RAW files
 #[derive(Parser, Debug)]
@@ -31,16 +56,20 @@ struct Args {
     #[arg(long)]
     feather_input: bool,
 
+    /// Select sensor for analysis (0=combined [default], 1=first sensors, 2=second sensors)
+    #[arg(long)]
+    sensor: Option<SensorSelection>,
+
     /// Start time (format: YYYY-MM-DD HH:MM), defaults to 24 hours ago
-    #[arg(long, env = "ANALYSIS_START_TIME")]
+    #[arg(long)]
     start_time: Option<String>,
 
     /// End time (format: YYYY-MM-DD HH:MM), defaults to now
-    #[arg(long, env = "ANALYSIS_END_TIME")]
+    #[arg(long)]
     end_time: Option<String>,
 
     /// CSV output file prefix (e.g. /path/to/output/prefix)
-    #[arg(long, env = "CSV_OUTPUT")]
+    #[arg(long)]
     csv_output: Option<String>,
 
     /// Window size for smoothing HR results
@@ -97,12 +126,6 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
-struct BatchItem {
-    seq: u32,
-    data: Vec<u8>,
-}
-
-#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct BedTempSide {
     side: f32,
@@ -110,29 +133,6 @@ struct BedTempSide {
     cen: f32,
     #[serde(rename = "in")]
     _in: f32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)]
-enum SensorData {
-    #[serde(rename = "piezo-dual")]
-    PiezoDual {
-        ts: i64,
-        adc: u8,
-        freq: u16,
-        gain: u16,
-        #[serde(with = "serde_bytes")]
-        left1: Vec<u8>,
-        #[serde(default)]
-        #[serde(with = "serde_bytes")]
-        left2: Option<Vec<u8>>,
-        #[serde(with = "serde_bytes")]
-        right1: Vec<u8>,
-        #[serde(default)]
-        #[serde(with = "serde_bytes")]
-        right2: Option<Vec<u8>>,
-    }
 }
 
 #[derive(Debug, Serialize, Copy, Clone)]
@@ -180,6 +180,17 @@ pub struct RawDataView<'a> {
     end_idx: usize,
 }
 
+#[derive(Debug)]
+pub struct RawPeriodData<'a> {
+    pub timestamp: DateTime<Utc>,
+    pub left1: &'a [i32],
+    pub left2: Option<&'a [i32]>,
+    pub right1: &'a [i32],
+    pub right2: Option<&'a [i32]>,
+    pub left: &'a [i32],
+    pub right: &'a [i32],
+}
+
 impl<'a> RawDataView<'a> {
     pub fn get_data_at(&self, idx: usize) -> Option<RawPeriodData<'a>> {
         if idx >= self.end_idx - self.start_idx {
@@ -189,6 +200,10 @@ impl<'a> RawDataView<'a> {
         let data = &self.raw_data[self.start_idx + idx].1;
         Some(RawPeriodData {
             timestamp: DateTime::from_timestamp(data.ts, 0).unwrap(),
+            left1: &data.left1,
+            left2: data.left2.as_deref(),
+            right1: &data.right1,
+            right2: data.right2.as_deref(),
             left: &data.left,
             right: &data.right,
         })
@@ -201,13 +216,6 @@ impl<'a> RawDataView<'a> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
-
-#[derive(Debug)]
-pub struct RawPeriodData<'a> {
-    pub timestamp: DateTime<Utc>,
-    pub left: &'a [i32],
-    pub right: &'a [i32],
 }
 
 fn create_raw_data_view<'a>(
@@ -363,39 +371,6 @@ fn remove_time_outliers(data: &mut Vec<ProcessedData>) {
 
     println!("Removed {} rows as date outliers", len_before - data.len());
     println!("Remaining rows: {}", data.len());
-}
-
-fn decode_batch_item(file_path: &PathBuf) -> Result<Vec<(u32, SensorData)>> {
-    let file = File::open(file_path)
-        .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut items = Vec::new();
-
-    loop {
-        let batch_item: BatchItem = match ciborium::from_reader(&mut reader) {
-            Ok(item) => item,
-            Err(ciborium::de::Error::Io(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                eprintln!("Warning: Skipping malformed CBOR data: {}", e);
-                continue;
-            }
-        };
-
-        match ciborium::from_reader(batch_item.data.as_slice()) {
-            Ok(sensor_data) => {
-                items.push((batch_item.seq, sensor_data));
-            }
-            Err(_) => {
-                continue;
-            }
-        }
-    }
-
-    Ok(items)
 }
 
 fn scale_data(data: &mut Vec<ProcessedData>) {
@@ -777,10 +752,14 @@ fn analyze_bed_presence_periods(
         // Extract and analyze raw data for the entire period
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        // Extract signals
-        let mut combined_signal: Vec<i32> = (0..raw_data_view.len())
+        // Extract signal
+        let mut signal: Vec<i32> = (0..raw_data_view.len())
             .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .map(|data| data.left.to_vec())
+            .map(|data| match args.sensor {
+                Some(SensorSelection::First) => data.left1.to_vec(),
+                Some(SensorSelection::Second) => data.left2.unwrap_or_default().to_vec(),
+                Some(SensorSelection::Combined) | None => data.left.to_vec(),
+            })
             .flatten()
             .collect();
 
@@ -793,13 +772,13 @@ fn analyze_bed_presence_periods(
                 .collect();
 
             // Average the signals
-            for (left, right) in combined_signal.iter_mut().zip(right_signal.iter()) {
+            for (left, right) in signal.iter_mut().zip(right_signal.iter()) {
                 *left = ((*left as i64 + *right as i64) / 2) as i32;
             }
         }
 
         let analysis_combined = analyse_sensor_data(
-            &combined_signal,
+            &signal,
             &raw_data_view,
             samples_per_segment_hr,
             step_size_hr,
@@ -846,14 +825,18 @@ fn analyze_bed_presence_periods(
             let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
             // Extract signals
-            let combined_signal: Vec<i32> = (0..raw_data_view.len())
+            let signal: Vec<i32> = (0..raw_data_view.len())
                 .filter_map(|idx| raw_data_view.get_data_at(idx))
-                .map(|data| data.right.to_vec())
+                .map(|data| match args.sensor {
+                    Some(SensorSelection::First) => data.right1.to_vec(),
+                    Some(SensorSelection::Second) => data.right2.unwrap_or_default().to_vec(),
+                    Some(SensorSelection::Combined) | None => data.right.to_vec(),
+                })
                 .flatten()
                 .collect();
 
             let analysis_combined = analyse_sensor_data(
-                &combined_signal,
+                &signal,
                 &raw_data_view,
                 samples_per_segment_hr,
                 step_size_hr,
@@ -998,245 +981,7 @@ struct RawFileInfo {
     end_time: DateTime<Utc>,
 }
 
-fn build_raw_file_index(raw_dir: &PathBuf) -> Result<Vec<RawFileInfo>> {
-    let mut file_index = Vec::new();
-
-    for entry in std::fs::read_dir(raw_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.extension().and_then(|s| s.to_str()) == Some("RAW") {
-            println!("Indexing file: {}", path.display());
-
-            // Load file to extract metadata
-            let items = decode_batch_item(&path)?;
-
-            if items.is_empty() {
-                println!("Skipping empty file: {}", path.display());
-                continue;
-            }
-
-            // Find sequence range and time range
-            let mut first_seq = u32::MAX;
-            let mut last_seq = 0;
-            let mut start_time = DateTime::<Utc>::MAX_UTC;
-            let mut end_time = DateTime::<Utc>::MIN_UTC;
-
-            for (seq, data) in &items {
-                if let SensorData::PiezoDual { ts, .. } = data {
-                    first_seq = first_seq.min(*seq);
-                    last_seq = last_seq.max(*seq);
-
-                    let timestamp = DateTime::from_timestamp(*ts, 0).unwrap();
-                    start_time = start_time.min(timestamp);
-                    end_time = end_time.max(timestamp);
-                }
-            }
-
-            file_index.push(RawFileInfo {
-                path,
-                first_seq,
-                last_seq,
-                start_time,
-                end_time,
-            });
-        }
-    }
-
-    // Sort by first sequence number
-    file_index.sort_by_key(|info| info.first_seq);
-
-    println!("\nFound {} RAW files:", file_index.len());
-    for info in &file_index {
-        println!(
-            "  {} (seq: {} to {}, time: {} to {})",
-            info.path.file_name().unwrap().to_string_lossy(),
-            info.first_seq,
-            info.last_seq,
-            info.start_time.format("%Y-%m-%d %H:%M:%S"),
-            info.end_time.format("%Y-%m-%d %H:%M:%S")
-        );
-    }
-
-    Ok(file_index)
-}
-
-#[derive(Debug)]
-struct CombinedSensorData {
-    ts: i64,
-    left: Vec<i32>,
-    right: Vec<i32>,
-}
-
-impl<'a> From<&'a SensorData> for Option<CombinedSensorData> {
-    fn from(data: &'a SensorData) -> Option<CombinedSensorData> {
-        if let SensorData::PiezoDual {
-            ts,
-            left1,
-            left2,
-            right1,
-            right2,
-            ..
-        } = data
-        {
-            // Convert left side data
-            let left: Vec<i32> = match left2 {
-                // If we have left2, average left1 and left2
-                Some(left2_data) => left1
-                    .chunks_exact(4)
-                    .zip(left2_data.chunks_exact(4))
-                    .map(|(a, b)| {
-                        let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-                        let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                        ((val1 as i64 + val2 as i64) / 2) as i32
-                    })
-                    .collect(),
-                // If no left2, just convert left1
-                None => left1
-                    .chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect(),
-            };
-
-            // Convert right side data
-            let right: Vec<i32> = match right2 {
-                // If we have right2, average right1 and right2
-                Some(right2_data) => right1
-                    .chunks_exact(4)
-                    .zip(right2_data.chunks_exact(4))
-                    .map(|(a, b)| {
-                        let val1 = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-                        let val2 = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                        ((val1 as i64 + val2 as i64) / 2) as i32
-                    })
-                    .collect(),
-                // If no right2, just convert right1
-                None => right1
-                    .chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect(),
-            };
-
-            Some(CombinedSensorData {
-                ts: *ts,
-                left,
-                right,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-// Add new function to read CSV data
-fn read_csv_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
-    let file = File::open(path)?;
-    let mut rdr = csv::ReaderBuilder::new()
-        .flexible(true)  // Handle variable number of fields
-        .from_reader(file);
-    let mut data = Vec::new();
-
-    for result in rdr.records() {
-        let record = result?;
-
-        // Parse the timestamp from datetime string
-        let dt = NaiveDateTime::parse_from_str(record.get(1).unwrap(), "%Y-%m-%d %H:%M:%S")?;
-        let ts = dt.timestamp();
-
-        let freq: u16 = record.get(2).unwrap().parse()?;
-        let adc: u8 = record.get(3).unwrap().parse()?;
-        let gain: u16 = record.get(4).unwrap().parse()?;
-
-        // Parse left1 and right1 as space-separated integers
-        let parse_signal = |s: &str| -> Result<Vec<i32>> {
-            // Remove square brackets and split on whitespace
-            let cleaned = s.trim_matches(|c| c == '[' || c == ']' || c == ' ')
-                .split_whitespace()  // This handles multiple spaces and newlines
-                .filter(|s| !s.is_empty());
-
-            cleaned
-                .map(|s| s.parse::<i32>())
-                .collect::<Result<Vec<i32>, _>>()
-                .map_err(|e| anyhow::anyhow!("Failed to parse signal data: {}", e))
-        };
-
-        let left1 = parse_signal(record.get(5).unwrap())?;
-        let right1 = parse_signal(record.get(6).unwrap())?;
-        let seq: u32 = record.get(7).unwrap().parse()?;
-
-        // Create CombinedSensorData
-        let combined = CombinedSensorData {
-            ts,
-            left: left1,
-            right: right1,
-        };
-
-        data.push((seq, combined));
-    }
-
-    Ok(data)
-}
-
-// Add new function to read Feather data
-fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)>> {
-    let file = File::open(path)?;
-    let reader = FileReaderBuilder::new().build(file)?;
-    let mut data = Vec::new();
-    let mut seq = 0;
-
-    for batch in reader {
-        let batch = batch?;
-
-        // Get column arrays
-        let type_col = batch.column_by_name("type").expect("type column missing")
-            .as_any().downcast_ref::<StringArray>().expect("type column should be strings");
-        let ts_col = batch.column_by_name("ts").expect("ts column missing")
-            .as_any().downcast_ref::<StringArray>().expect("ts column should be strings");
-        let left1_col = batch.column_by_name("left1").expect("left1 column missing")
-            .as_any().downcast_ref::<ListArray>().expect("left1 column should be a list");
-        let right1_col = batch.column_by_name("right1").expect("right1 column missing")
-            .as_any().downcast_ref::<ListArray>().expect("right1 column should be a list");
-
-        // Process each row
-        for row in 0..batch.num_rows() {
-            // Only process piezo-dual records
-            if type_col.value(row) == "piezo-dual" {
-                // Parse timestamp from string
-                let ts = NaiveDateTime::parse_from_str(ts_col.value(row), "%Y-%m-%d %H:%M:%S")?
-                    .timestamp();
-
-                // Get left and right signals as i32 arrays
-                let left_values = left1_col.value(row);
-                let right_values = right1_col.value(row);
-
-                let left = left_values.as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("left values should be i32")
-                    .values()
-                    .to_vec();
-
-                let right = right_values.as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("right values should be i32")
-                    .values()
-                    .to_vec();
-
-                let combined = CombinedSensorData {
-                    ts,
-                    left,
-                    right,
-                };
-
-                data.push((seq, combined));
-                seq += 1;
-            }
-        }
-    }
-
-    Ok(data)
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     // Initialize logger
     env_logger::init();
 
@@ -1294,8 +1039,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let file_index = build_raw_file_index(&args.input_path)?;
 
         if file_index.is_empty() {
-            println!("No RAW files found");
-            return Ok(());
+            return Err(anyhow::anyhow!(
+                "No RAW files found in directory: {}",
+                args.input_path.display()
+            ));
         }
 
         // Only filter files by time range if provided
@@ -1308,10 +1055,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             file_index
         };
 
-        println!(
-            "\nProcessing {} RAW files",
-            relevant_files.len()
-        );
+        println!("\nProcessing {} RAW files", relevant_files.len());
 
         // Load and process files in sequence order
         let mut data = Vec::new();
