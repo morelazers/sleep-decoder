@@ -285,8 +285,8 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
             .column_by_name("ts")
             .expect("ts column missing")
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("ts column should be strings");
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("ts column should be timestamp nanoseconds");
         let left1_col = batch
             .column_by_name("left1")
             .expect("left1 column missing")
@@ -312,10 +312,8 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
         for row in 0..batch.num_rows() {
             // Only process piezo-dual records
             if type_col.value(row) == "piezo-dual" {
-                // Parse timestamp from string
-                let ts = NaiveDateTime::parse_from_str(ts_col.value(row), "%Y-%m-%d %H:%M:%S")?
-                    .and_utc()
-                    .timestamp();
+                // Convert nanosecond timestamp to Unix timestamp (seconds)
+                let ts = ts_col.value(row) / 1_000_000_000;
 
                 // Get required signals as i32 arrays
                 let left1_values = left1_col.value(row);
@@ -374,9 +372,9 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
                 let combined = CombinedSensorData {
                     ts,
                     left1: left1.clone(),
-                    left2,
+                    left2: left2,
                     right1: right1.clone(),
-                    right2,
+                    right2: right2,
                     left,
                     right,
                 };
