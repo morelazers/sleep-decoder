@@ -367,10 +367,10 @@ fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
     // Less aggressive HR zone restrictions
     let max_hr = if prev_hr < 65.0 {
         // Low HR zone - allow more upward movement
-        (prev_hr + upward_change * 0.8).min(80.0)
+        (prev_hr + upward_change * 0.8).min(85.0)
     } else if prev_hr < 75.0 {
         // Medium HR zone
-        (prev_hr + upward_change * 0.9).min(95.0)
+        (prev_hr + upward_change * 0.9).min(100.0)
     } else {
         // High HR zone
         max_hr
@@ -384,14 +384,21 @@ fn is_suspicious_change(bpm: f32, magnitude: f32, max_magnitude: f32, prev_hr: f
     let hr_change = (bpm - prev_hr).abs();
     let normalized_magnitude = magnitude / max_magnitude;
 
-    // Criteria for suspicious changes:
-    // 1. Large change with weak peak
-    // 2. Magnitude threshold increases with larger changes
+    // Require stronger evidence for higher heart rates
+    let base_required_magnitude = 0.3 + (hr_change / 20.0).min(0.3);
+    let high_hr_penalty = if bpm > 80.0 {
+        // Additional magnitude requirement for rates above 80 BPM
+        ((bpm - 80.0) / 20.0).min(0.3)
+    } else {
+        0.0
+    };
 
-    let required_magnitude = 0.3 + (hr_change / 20.0).min(0.3); // Higher threshold for bigger changes
+    let required_magnitude = base_required_magnitude + high_hr_penalty;
 
+    // More stringent checks for higher rates
     (hr_change > 8.0 && normalized_magnitude < required_magnitude)
         || (hr_change > 15.0 && normalized_magnitude < 0.6)
+        || (bpm > 80.0 && normalized_magnitude < (0.5 + high_hr_penalty))
 }
 
 /// Calculate the harmonic penalty factor for a given frequency
@@ -405,34 +412,50 @@ fn calculate_harmonic_penalty(
     harmonic_close_threshold: f32,
     harmonic_far_threshold: f32,
 ) -> f32 {
-    if let Some((br, stability)) = breathing_data {
+    // Base penalty from existing logic
+    let mut penalty = if let Some((br, stability)) = breathing_data {
         // Calculate breathing harmonics
         let fundamental = br / 60.0; // Convert BPM to Hz
         let harmonics = vec![
             fundamental * 2.0, // Second harmonic
             fundamental * 3.0, // Third harmonic
             fundamental * 4.0, // Fourth harmonic
+            fundamental * 5.0, // Fifth harmonic - added for higher coverage
         ];
 
-        // Check if frequency is near a harmonic
-        let is_harmonic = harmonics.iter().any(|&h| (freq - h).abs() < 0.05);
+        // Check if frequency is near a harmonic with tighter bounds for higher rates
+        let harmonic_threshold = if bpm > 80.0 {
+            0.03 // Tighter threshold for higher rates
+        } else {
+            0.05 // Original threshold
+        };
+
+        let is_harmonic = harmonics
+            .iter()
+            .any(|&h| (freq - h).abs() < harmonic_threshold);
+
         if is_harmonic {
             // If we have a previous heart rate, check if this peak is close to it
             if let Some(prev_hr) = prev_hr {
                 let freq_diff = (bpm - prev_hr).abs();
                 if freq_diff < harmonic_close_threshold {
-                    // If very close to previous HR, don't penalize
-                    1.0
+                    1.0 // No penalty if very close to previous HR
                 } else {
-                    // Scale penalty by breathing stability
-                    // High stability (1.0) -> full penalty
-                    // Low stability (0.0) -> minimal penalty
+                    // Scale penalty by breathing stability and heart rate
                     let base_penalty = if freq_diff < harmonic_far_threshold {
                         harmonic_penalty_close
                     } else {
                         harmonic_penalty_far
                     };
-                    1.0 - (1.0 - base_penalty) * stability
+
+                    // Increase penalty for higher heart rates
+                    let hr_factor = if bpm > 80.0 {
+                        1.0 + ((bpm - 80.0) / 40.0).min(0.5)
+                    } else {
+                        1.0
+                    };
+
+                    1.0 - ((1.0 - base_penalty) * stability * hr_factor)
                 }
             } else {
                 // No previous HR, scale penalty by stability
@@ -443,7 +466,19 @@ fn calculate_harmonic_penalty(
         }
     } else {
         1.0
+    };
+
+    // Additional penalty for higher heart rates without strong historical support
+    if bpm > 80.0 {
+        if let Some(prev_hr) = prev_hr {
+            if prev_hr < 75.0 {
+                // Stronger penalty for jumping to high HR from low HR
+                penalty *= 0.8;
+            }
+        }
     }
+
+    penalty
 }
 
 /// Modify the heart rate analysis function to use breathing rate data
@@ -455,7 +490,7 @@ pub fn analyze_heart_rate_fft(
     history: &mut HeartRateHistory,
     fft_context: &mut FftContext,
     time_step: f32,
-    breathing_data: Option<(f32, f32)>, // (rate, stability)
+    breathing_data: Option<(f32, f32)>,
     hr_outlier_percentile: f32,
     hr_history_window: usize,
     harmonic_penalty_close: f32,
@@ -463,10 +498,23 @@ pub fn analyze_heart_rate_fft(
     harmonic_close_threshold: f32,
     harmonic_far_threshold: f32,
 ) -> Option<f32> {
+    // Calculate initial range - broader when no history exists
+    let (min_hr, max_hr) = if let Some(prev_hr) = prev_hr {
+        get_adaptive_hr_range(prev_hr, time_step)
+    } else {
+        (40.0, 90.0) // Broader initial range
+    };
+
     // Check both trend and physiological plausibility
     if let Some(prev_hr) = prev_hr {
-        // Check overall trend
+        // Check overall trend with more stringent validation for higher rates
         if let Some(trend) = history.get_trend() {
+            let max_allowed_trend = if prev_hr > 80.0 || trend > 0.0 {
+                0.8 // More conservative for high rates or increasing trends
+            } else {
+                1.2 // Original value for decreasing trends at normal rates
+            };
+
             if !validate_rate_of_change(trend, trend < 0.0) {
                 debug!("Trend too steep ({:.2} BPM/min), being conservative", trend);
                 let smoothed_bpm = prev_hr;
@@ -476,38 +524,26 @@ pub fn analyze_heart_rate_fft(
         }
     }
 
-    // Use FFT context instead of creating new buffers
+    // Use FFT context to process signal
     let buffer = fft_context.process(signal);
 
-    // Calculate frequency range
-    let (min_hr, max_hr) = if let Some(prev_hr) = prev_hr {
-        get_adaptive_hr_range(prev_hr, time_step)
-    } else {
-        (40.0, 90.0) // Default range if no previous HR
-    };
-
-    // Convert BPM to Hz
-    let min_freq = min_hr / 60.0;
-    let max_freq = max_hr / 60.0;
-
-    // Calculate bin range for FFT
+    // Calculate frequency resolution and bin ranges
     let freq_resolution = sample_rate / signal.len() as f32;
-    let min_bin = (min_freq / freq_resolution) as usize;
-    let max_bin = (max_freq / freq_resolution) as usize;
+    let min_bin = (min_hr / 60.0 / freq_resolution) as usize;
+    let max_bin = (max_hr / 60.0 / freq_resolution) as usize;
 
-    // Find all peaks in the heart rate range
+    // Find peaks with enhanced validation
     let mut peaks = Vec::new();
     for bin in min_bin + 1..=max_bin - 1 {
         let magnitude = (buffer[bin].norm_sqr() as f32).sqrt();
         let prev_magnitude = (buffer[bin - 1].norm_sqr() as f32).sqrt();
         let next_magnitude = (buffer[bin + 1].norm_sqr() as f32).sqrt();
 
-        // Check if this is a local maximum
         if magnitude > prev_magnitude && magnitude > next_magnitude {
             let freq = bin as f32 * freq_resolution;
             let bpm = freq * 60.0;
 
-            // Calculate harmonic penalty
+            // Calculate harmonic penalty with enhanced validation
             let harmonic_factor = calculate_harmonic_penalty(
                 freq,
                 bpm,
@@ -519,7 +555,16 @@ pub fn analyze_heart_rate_fft(
                 harmonic_far_threshold,
             );
 
-            peaks.push((bpm, magnitude * harmonic_factor));
+            // Additional validation for higher heart rates
+            let high_hr_factor = if bpm > 80.0 {
+                // Require increasingly strong evidence for higher rates
+                let excess = bpm - 80.0;
+                0.8 - (excess / 40.0).min(0.3)
+            } else {
+                1.0
+            };
+
+            peaks.push((bpm, magnitude * harmonic_factor * high_hr_factor));
         }
     }
 
