@@ -7,6 +7,7 @@ pub enum SensorSelection {
     Combined, // 0: Use combined sensors (default)
     First,    // 1: Use left1/right1
     Second,   // 2: Use left2/right2
+    Choose,   // New variant for automatic sensor selection
 }
 
 impl FromStr for SensorSelection {
@@ -17,6 +18,7 @@ impl FromStr for SensorSelection {
             "0" => Ok(SensorSelection::Combined),
             "1" => Ok(SensorSelection::First),
             "2" => Ok(SensorSelection::Second),
+            "choose" => Ok(SensorSelection::Choose),
             _ => Err(format!("Invalid sensor selection: {}. Use 0 for combined sensors (default), 1 for first sensors (left1/right1), or 2 for second sensors (left2/right2)", s)),
         }
     }
@@ -105,4 +107,8 @@ pub struct Args {
     /// Smoothing strength for heart rate data (0.1 to 2.0, higher = more smoothing, default 0.25)
     #[arg(long, default_value = "0.25")]
     pub hr_smoothing_strength: f32,
+
+    /// Enable median-based reprocessing of early windows
+    #[arg(long)]
+    pub enable_median_reprocessing: bool,
 }

@@ -1,3 +1,4 @@
+use crate::PeriodAnalysis;
 use crate::RawDataView;
 use chrono::{DateTime, Duration, Utc};
 use log::debug;
@@ -375,7 +376,7 @@ fn get_adaptive_hr_range(prev_hr: f32, time_step: f32) -> (f32, f32) {
         (prev_hr + upward_change * 0.8).min(85.0)
     } else if prev_hr < 75.0 {
         // Medium HR zone
-        (prev_hr + upward_change * 0.9).min(100.0)
+        (prev_hr + upward_change * 0.9).min(90.0)
     } else {
         // High HR zone
         max_hr
@@ -878,4 +879,81 @@ fn scale_data_into(data: &[f32], lower: f32, upper: f32, output: &mut Vec<f32>) 
 fn remove_baseline_wander_into(data: &[f32], sample_rate: f32, cutoff: f32, output: &mut Vec<f32>) {
     let filtered = remove_baseline_wander(data, sample_rate, cutoff);
     output.extend_from_slice(&filtered);
+}
+
+/// Compare two sensor analyses and return the one that appears more physiologically plausible
+pub fn compare_sensor_analysis<'a>(
+    sensor1: &'a PeriodAnalysis,
+    sensor2: &'a PeriodAnalysis,
+) -> Option<&'a PeriodAnalysis> {
+    // Helper function to compute statistics for a sensor's heart rate data
+    fn compute_stats(hrs: &[(DateTime<Utc>, f32)]) -> Option<(f32, f32)> {
+        // returns (median, variance)
+        if hrs.is_empty() {
+            return None;
+        }
+
+        // Calculate median
+        let mut values: Vec<f32> = hrs.iter().map(|(_, hr)| *hr).collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = values[values.len() / 2];
+
+        // Calculate variance
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        let variance = values.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / values.len() as f32;
+
+        Some((median, variance))
+    }
+
+    // Compute statistics for both sensors
+    let stats1 = compute_stats(&sensor1.fft_heart_rates);
+    let stats2 = compute_stats(&sensor2.fft_heart_rates);
+
+    match (stats1, stats2) {
+        (Some((median1, variance1)), Some((median2, variance2))) => {
+            // Score each sensor based on multiple factors
+            let score1 = score_sensor_output(median1, variance1);
+            let score2 = score_sensor_output(median2, variance2);
+
+            // Return the sensor with the better score
+            if score1 >= score2 {
+                Some(sensor1)
+            } else {
+                Some(sensor2)
+            }
+        }
+        (Some(_), None) => Some(sensor1),
+        (None, Some(_)) => Some(sensor2),
+        (None, None) => None,
+    }
+}
+
+/// Score a sensor's output based on physiological plausibility and consistency
+fn score_sensor_output(median: f32, variance: f32) -> f32 {
+    let mut score = 0.0;
+
+    // Factor 1: Median HR should be in a reasonable range for sleep
+    // Ideal sleeping HR is typically between 50-70 BPM
+    let median_score = if median >= 45.0 && median <= 85.0 {
+        // Higher score for values closer to the ideal range
+        let distance_from_ideal = if median < 50.0 {
+            (median - 50.0).abs()
+        } else if median > 70.0 {
+            (median - 70.0).abs()
+        } else {
+            0.0
+        };
+        1.0 - (distance_from_ideal / 35.0).min(1.0) // Normalize to [0,1]
+    } else {
+        0.0 // Highly unlikely sleeping HR
+    };
+
+    // Factor 2: Lower variance is generally better (indicates more stable measurements)
+    // Typical variance during sleep might be around 25-100
+    let variance_score = 1.0 - (variance / 200.0).min(1.0);
+
+    // Combine scores (currently weighted equally)
+    score = median_score * 0.6 + variance_score * 0.4;
+
+    score
 }

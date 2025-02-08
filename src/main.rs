@@ -174,6 +174,7 @@ fn analyse_sensor_data(
     harmonic_penalty_far: f32,
     harmonic_close_threshold: f32,
     harmonic_far_threshold: f32,
+    enable_median_reprocessing: bool,
 ) -> PeriodAnalysis {
     let mut breathing_rates = Vec::new();
     let mut br_fft_context = heart_analysis::FftContext::new(samples_per_segment_br);
@@ -263,87 +264,91 @@ fn analyse_sensor_data(
         }
     }
 
-    // Calculate median HR from all valid estimates
-    let median_hr = if !fft_heart_rates.is_empty() {
-        let mut hrs: Vec<f32> = fft_heart_rates.iter().map(|(_, hr)| *hr).collect();
-        hrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        Some(hrs[hrs.len() / 2])
-    } else {
-        None
-    };
+    // Only perform median-based reprocessing if enabled
+    if enable_median_reprocessing {
+        // Calculate median HR from all valid estimates
+        let median_hr = if !fft_heart_rates.is_empty() {
+            let mut hrs: Vec<f32> = fft_heart_rates.iter().map(|(_, hr)| *hr).collect();
+            hrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            Some(hrs[hrs.len() / 2])
+        } else {
+            None
+        };
 
-    // Second pass - conditionally reprocess early windows
-    if let Some(median) = median_hr {
-        const REPROCESS_THRESHOLD: f32 = 10.0; // BPM threshold for reprocessing
-        const EARLY_WINDOW_HOURS: i64 = 3;
+        // Second pass - conditionally reprocess early windows
+        if let Some(median) = median_hr {
+            const REPROCESS_THRESHOLD: f32 = 7.5; // BPM threshold for reprocessing
+            const EARLY_WINDOW_HOURS: i64 = 4;
 
-        // Clear history for second pass
-        hr_history.clear();
-        prev_hr = None;
+            // Clear history for second pass
+            hr_history.clear();
+            prev_hr = None;
 
-        // Get the cutoff time for early windows (2 hours from start)
-        let start_time = hr_windows.first().map(|w| w.timestamp);
-        if let Some(start) = start_time {
-            let early_cutoff = start + chrono::Duration::hours(EARLY_WINDOW_HOURS);
+            // Get the cutoff time for early windows
+            let start_time = hr_windows.first().map(|w| w.timestamp);
+            if let Some(start) = start_time {
+                let early_cutoff = start + chrono::Duration::hours(EARLY_WINDOW_HOURS);
 
-            // Create a new vector for the final results
-            let mut final_heart_rates = Vec::new();
+                // Create a new vector for the final results
+                let mut final_heart_rates = Vec::new();
 
-            for (i, window) in hr_windows.iter().enumerate() {
-                if window.timestamp <= early_cutoff {
-                    // For early windows, check if we need to reprocess
-                    let current_hr = fft_heart_rates.get(i).map(|(_, hr)| *hr);
+                for (i, window) in hr_windows.iter().enumerate() {
+                    if window.timestamp <= early_cutoff {
+                        // For early windows, check if we need to reprocess
+                        let current_hr = fft_heart_rates.get(i).map(|(_, hr)| *hr);
 
-                    let needs_reprocessing =
-                        current_hr.map_or(true, |hr| (hr - median).abs() > REPROCESS_THRESHOLD);
+                        let needs_reprocessing =
+                            current_hr.map_or(true, |hr| (hr - median).abs() > REPROCESS_THRESHOLD);
 
-                    if needs_reprocessing {
-                        // Reprocess with median-informed range
-                        let breathing_data = breathing_rates_with_stability
-                            .iter()
-                            .min_by_key(|(br_time, _, _)| {
-                                (br_time.timestamp() - window.timestamp.timestamp()).abs() as u64
-                            })
-                            .map(|(_, rate, stability)| (*rate, *stability));
+                        if needs_reprocessing {
+                            // Reprocess with median-informed range
+                            let breathing_data = breathing_rates_with_stability
+                                .iter()
+                                .min_by_key(|(br_time, _, _)| {
+                                    (br_time.timestamp() - window.timestamp.timestamp()).abs()
+                                        as u64
+                                })
+                                .map(|(_, rate, stability)| (*rate, *stability));
 
-                        if let Some(new_hr) = heart_analysis::analyze_heart_rate_fft(
-                            &window.processed_signal,
-                            500.0,
-                            prev_hr,
-                            window.timestamp,
-                            &mut hr_history,
-                            &mut hr_fft_context,
-                            time_step,
-                            breathing_data,
-                            hr_outlier_percentile,
-                            hr_history_window,
-                            harmonic_penalty_close,
-                            harmonic_penalty_far,
-                            harmonic_close_threshold,
-                            harmonic_far_threshold,
-                            Some(median - 20.0),
-                            Some(median + 15.0),
-                        ) {
-                            final_heart_rates.push((window.timestamp, new_hr));
-                            prev_hr = Some(new_hr);
+                            if let Some(new_hr) = heart_analysis::analyze_heart_rate_fft(
+                                &window.processed_signal,
+                                500.0,
+                                prev_hr,
+                                window.timestamp,
+                                &mut hr_history,
+                                &mut hr_fft_context,
+                                time_step,
+                                breathing_data,
+                                hr_outlier_percentile,
+                                hr_history_window,
+                                harmonic_penalty_close,
+                                harmonic_penalty_far,
+                                harmonic_close_threshold,
+                                harmonic_far_threshold,
+                                Some(median - 20.0),
+                                Some(median + 15.0),
+                            ) {
+                                final_heart_rates.push((window.timestamp, new_hr));
+                                prev_hr = Some(new_hr);
+                            }
+                        } else {
+                            // Keep original estimate
+                            if let Some((ts, hr)) = fft_heart_rates.get(i) {
+                                final_heart_rates.push((*ts, *hr));
+                                prev_hr = Some(*hr);
+                            }
                         }
                     } else {
-                        // Keep original estimate
+                        // For later windows, keep original estimates
                         if let Some((ts, hr)) = fft_heart_rates.get(i) {
                             final_heart_rates.push((*ts, *hr));
                             prev_hr = Some(*hr);
                         }
                     }
-                } else {
-                    // For later windows, keep original estimates
-                    if let Some((ts, hr)) = fft_heart_rates.get(i) {
-                        final_heart_rates.push((*ts, *hr));
-                        prev_hr = Some(*hr);
-                    }
                 }
-            }
 
-            fft_heart_rates = final_heart_rates;
+                fft_heart_rates = final_heart_rates;
+            }
         }
     }
 
@@ -410,45 +415,100 @@ fn analyze_bed_presence_periods(
         // Extract and analyze raw data for the entire period
         let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-        // Extract signal
-        let mut signal: Vec<i32> = (0..raw_data_view.len())
-            .filter_map(|idx| raw_data_view.get_data_at(idx))
-            .map(|data| match args.sensor {
-                Some(SensorSelection::First) => data.left1.to_vec(),
-                Some(SensorSelection::Second) => data.left2.unwrap_or_default().to_vec(),
-                Some(SensorSelection::Combined) | None => data.left.to_vec(),
-            })
-            .flatten()
-            .collect();
-
-        // If merging sides, add right side data
-        if args.merge_sides {
-            let right_signal: Vec<i32> = (0..raw_data_view.len())
+        let analysis_combined = if let Some(SensorSelection::Choose) = args.sensor {
+            // Run analysis on both sensors
+            let signal1: Vec<i32> = (0..raw_data_view.len())
                 .filter_map(|idx| raw_data_view.get_data_at(idx))
-                .map(|data| data.right.to_vec())
+                .map(|data| data.left1.to_vec())
                 .flatten()
                 .collect();
 
-            // Average the signals
-            for (left, right) in signal.iter_mut().zip(right_signal.iter()) {
-                *left = ((*left as i64 + *right as i64) / 2) as i32;
-            }
-        }
+            let signal2: Vec<i32> = (0..raw_data_view.len())
+                .filter_map(|idx| raw_data_view.get_data_at(idx))
+                .map(|data| data.left2.unwrap_or_default().to_vec())
+                .flatten()
+                .collect();
 
-        let analysis_combined = analyse_sensor_data(
-            &signal,
-            &raw_data_view,
-            samples_per_segment_hr,
-            step_size_hr,
-            samples_per_segment_br,
-            step_size_br,
-            args.hr_outlier_percentile,
-            args.hr_history_window,
-            args.harmonic_penalty_close,
-            args.harmonic_penalty_far,
-            args.harmonic_close_threshold,
-            args.harmonic_far_threshold,
-        );
+            // Analyze both sensors
+            let analysis1 = analyse_sensor_data(
+                &signal1,
+                &raw_data_view,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
+                args.hr_outlier_percentile,
+                args.hr_history_window,
+                args.harmonic_penalty_close,
+                args.harmonic_penalty_far,
+                args.harmonic_close_threshold,
+                args.harmonic_far_threshold,
+                args.enable_median_reprocessing,
+            );
+
+            let analysis2 = analyse_sensor_data(
+                &signal2,
+                &raw_data_view,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
+                args.hr_outlier_percentile,
+                args.hr_history_window,
+                args.harmonic_penalty_close,
+                args.harmonic_penalty_far,
+                args.harmonic_close_threshold,
+                args.harmonic_far_threshold,
+                args.enable_median_reprocessing,
+            );
+
+            // Compare and choose the better analysis
+            heart_analysis::compare_sensor_analysis(&analysis1, &analysis2)
+                .map(|analysis| analysis.clone())
+                .unwrap_or(analysis1)
+        } else {
+            // Extract signal based on sensor selection
+            let mut signal: Vec<i32> = (0..raw_data_view.len())
+                .filter_map(|idx| raw_data_view.get_data_at(idx))
+                .map(|data| match args.sensor {
+                    Some(SensorSelection::First) => data.left1.to_vec(),
+                    Some(SensorSelection::Second) => data.left2.unwrap_or_default().to_vec(),
+                    Some(SensorSelection::Combined) | None => data.left.to_vec(),
+                    Some(SensorSelection::Choose) => unreachable!(),
+                })
+                .flatten()
+                .collect();
+
+            // Rest of the existing analysis code...
+            if args.merge_sides {
+                let right_signal: Vec<i32> = (0..raw_data_view.len())
+                    .filter_map(|idx| raw_data_view.get_data_at(idx))
+                    .map(|data| data.right.to_vec())
+                    .flatten()
+                    .collect();
+
+                // Average the signals
+                for (left, right) in signal.iter_mut().zip(right_signal.iter()) {
+                    *left = ((*left as i64 + *right as i64) / 2) as i32;
+                }
+            }
+
+            analyse_sensor_data(
+                &signal,
+                &raw_data_view,
+                samples_per_segment_hr,
+                step_size_hr,
+                samples_per_segment_br,
+                step_size_br,
+                args.hr_outlier_percentile,
+                args.hr_history_window,
+                args.harmonic_penalty_close,
+                args.harmonic_penalty_far,
+                args.harmonic_close_threshold,
+                args.harmonic_far_threshold,
+                args.enable_median_reprocessing,
+            )
+        };
 
         // Analyze sleep phases starting 30 minutes after period start
         let sleep_onset = period.start;
@@ -482,31 +542,86 @@ fn analyze_bed_presence_periods(
             // Extract and analyze raw data for the entire period
             let raw_data_view = extract_raw_data_for_period(raw_sensor_data, period);
 
-            // Extract signals
-            let signal: Vec<i32> = (0..raw_data_view.len())
-                .filter_map(|idx| raw_data_view.get_data_at(idx))
-                .map(|data| match args.sensor {
-                    Some(SensorSelection::First) => data.right1.to_vec(),
-                    Some(SensorSelection::Second) => data.right2.unwrap_or_default().to_vec(),
-                    Some(SensorSelection::Combined) | None => data.right.to_vec(),
-                })
-                .flatten()
-                .collect();
+            let analysis_combined = if let Some(SensorSelection::Choose) = args.sensor {
+                // Run analysis on both sensors
+                let signal1: Vec<i32> = (0..raw_data_view.len())
+                    .filter_map(|idx| raw_data_view.get_data_at(idx))
+                    .map(|data| data.right1.to_vec())
+                    .flatten()
+                    .collect();
 
-            let analysis_combined = analyse_sensor_data(
-                &signal,
-                &raw_data_view,
-                samples_per_segment_hr,
-                step_size_hr,
-                samples_per_segment_br,
-                step_size_br,
-                args.hr_outlier_percentile,
-                args.hr_history_window,
-                args.harmonic_penalty_close,
-                args.harmonic_penalty_far,
-                args.harmonic_close_threshold,
-                args.harmonic_far_threshold,
-            );
+                let signal2: Vec<i32> = (0..raw_data_view.len())
+                    .filter_map(|idx| raw_data_view.get_data_at(idx))
+                    .map(|data| data.right2.unwrap_or_default().to_vec())
+                    .flatten()
+                    .collect();
+
+                // Analyze both sensors
+                let analysis1 = analyse_sensor_data(
+                    &signal1,
+                    &raw_data_view,
+                    samples_per_segment_hr,
+                    step_size_hr,
+                    samples_per_segment_br,
+                    step_size_br,
+                    args.hr_outlier_percentile,
+                    args.hr_history_window,
+                    args.harmonic_penalty_close,
+                    args.harmonic_penalty_far,
+                    args.harmonic_close_threshold,
+                    args.harmonic_far_threshold,
+                    args.enable_median_reprocessing,
+                );
+
+                let analysis2 = analyse_sensor_data(
+                    &signal2,
+                    &raw_data_view,
+                    samples_per_segment_hr,
+                    step_size_hr,
+                    samples_per_segment_br,
+                    step_size_br,
+                    args.hr_outlier_percentile,
+                    args.hr_history_window,
+                    args.harmonic_penalty_close,
+                    args.harmonic_penalty_far,
+                    args.harmonic_close_threshold,
+                    args.harmonic_far_threshold,
+                    args.enable_median_reprocessing,
+                );
+
+                // Compare and choose the better analysis
+                heart_analysis::compare_sensor_analysis(&analysis1, &analysis2)
+                    .map(|analysis| analysis.clone())
+                    .unwrap_or(analysis1)
+            } else {
+                // Extract signal based on sensor selection
+                let signal: Vec<i32> = (0..raw_data_view.len())
+                    .filter_map(|idx| raw_data_view.get_data_at(idx))
+                    .map(|data| match args.sensor {
+                        Some(SensorSelection::First) => data.right1.to_vec(),
+                        Some(SensorSelection::Second) => data.right2.unwrap_or_default().to_vec(),
+                        Some(SensorSelection::Combined) | None => data.right.to_vec(),
+                        Some(SensorSelection::Choose) => unreachable!(),
+                    })
+                    .flatten()
+                    .collect();
+
+                analyse_sensor_data(
+                    &signal,
+                    &raw_data_view,
+                    samples_per_segment_hr,
+                    step_size_hr,
+                    samples_per_segment_br,
+                    step_size_br,
+                    args.hr_outlier_percentile,
+                    args.hr_history_window,
+                    args.harmonic_penalty_close,
+                    args.harmonic_penalty_far,
+                    args.harmonic_close_threshold,
+                    args.harmonic_far_threshold,
+                    args.enable_median_reprocessing,
+                )
+            };
 
             // Analyze sleep phases starting 30 minutes after period start
             let sleep_onset = period.start;
