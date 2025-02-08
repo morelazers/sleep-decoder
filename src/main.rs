@@ -175,13 +175,9 @@ fn analyse_sensor_data(
     harmonic_close_threshold: f32,
     harmonic_far_threshold: f32,
 ) -> PeriodAnalysis {
-    let mut fft_heart_rates = Vec::new();
     let mut breathing_rates = Vec::new();
-    let mut prev_fft_hr = None;
-
-    // Create FFT contexts for both heart rate and breathing rate
-    let mut hr_fft_context = heart_analysis::FftContext::new(samples_per_segment_hr);
     let mut br_fft_context = heart_analysis::FftContext::new(samples_per_segment_br);
+    let mut hr_fft_context = heart_analysis::FftContext::new(samples_per_segment_hr);
     let mut hr_history = heart_analysis::HeartRateHistory::new(15.0 * 60.0);
 
     // Process breathing rate windows first...
@@ -209,35 +205,34 @@ fn analyse_sensor_data(
         .iter()
         .enumerate()
         .map(|(i, &(timestamp, rate))| {
-            // Get window of measurements centered on current point
             let start = i.saturating_sub(window_size / 2);
             let end = (i + window_size / 2 + 1).min(breathing_rates.len());
             let window = &breathing_rates[start..end];
 
-            // Calculate local variance
             let mean = window.iter().map(|(_, r)| r).sum::<f32>() / window.len() as f32;
             let variance =
                 window.iter().map(|(_, r)| (r - mean).powi(2)).sum::<f32>() / window.len() as f32;
-
-            // Convert variance to stability score (0 to 1)
             let stability = 1.0 / (1.0 + variance);
 
             (timestamp, rate, stability)
         })
         .collect();
 
-    // Process heart rate windows...
-    let hr_windows = heart_analysis::SignalWindowIterator::new(
+    // First pass: Process all windows to get initial estimates
+    let hr_windows: Vec<_> = heart_analysis::SignalWindowIterator::new(
         signal,
         raw_data,
         samples_per_segment_hr,
         step_size_hr,
-    );
+    )
+    .collect();
 
     let time_step = samples_per_segment_hr as f32 / 500.0;
+    let mut fft_heart_rates = Vec::new();
+    let mut prev_hr = None;
 
-    for window in hr_windows {
-        // Find the closest breathing rate measurement with stability
+    // First pass - process all windows
+    for window in &hr_windows {
         let breathing_data = breathing_rates_with_stability
             .iter()
             .min_by_key(|(br_time, _, _)| {
@@ -248,7 +243,7 @@ fn analyse_sensor_data(
         if let Some(fft_hr) = heart_analysis::analyze_heart_rate_fft(
             &window.processed_signal,
             500.0,
-            prev_fft_hr,
+            prev_hr,
             window.timestamp,
             &mut hr_history,
             &mut hr_fft_context,
@@ -260,9 +255,95 @@ fn analyse_sensor_data(
             harmonic_penalty_far,
             harmonic_close_threshold,
             harmonic_far_threshold,
+            None,
+            None,
         ) {
             fft_heart_rates.push((window.timestamp, fft_hr));
-            prev_fft_hr = Some(fft_hr);
+            prev_hr = Some(fft_hr);
+        }
+    }
+
+    // Calculate median HR from all valid estimates
+    let median_hr = if !fft_heart_rates.is_empty() {
+        let mut hrs: Vec<f32> = fft_heart_rates.iter().map(|(_, hr)| *hr).collect();
+        hrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(hrs[hrs.len() / 2])
+    } else {
+        None
+    };
+
+    // Second pass - conditionally reprocess early windows
+    if let Some(median) = median_hr {
+        const REPROCESS_THRESHOLD: f32 = 10.0; // BPM threshold for reprocessing
+        const EARLY_WINDOW_HOURS: i64 = 2;
+
+        // Clear history for second pass
+        hr_history.clear();
+        prev_hr = None;
+
+        // Get the cutoff time for early windows (2 hours from start)
+        let start_time = hr_windows.first().map(|w| w.timestamp);
+        if let Some(start) = start_time {
+            let early_cutoff = start + chrono::Duration::hours(EARLY_WINDOW_HOURS);
+
+            // Create a new vector for the final results
+            let mut final_heart_rates = Vec::new();
+
+            for (i, window) in hr_windows.iter().enumerate() {
+                if window.timestamp <= early_cutoff {
+                    // For early windows, check if we need to reprocess
+                    let current_hr = fft_heart_rates.get(i).map(|(_, hr)| *hr);
+
+                    let needs_reprocessing =
+                        current_hr.map_or(true, |hr| (hr - median).abs() > REPROCESS_THRESHOLD);
+
+                    if needs_reprocessing {
+                        // Reprocess with median-informed range
+                        let breathing_data = breathing_rates_with_stability
+                            .iter()
+                            .min_by_key(|(br_time, _, _)| {
+                                (br_time.timestamp() - window.timestamp.timestamp()).abs() as u64
+                            })
+                            .map(|(_, rate, stability)| (*rate, *stability));
+
+                        if let Some(new_hr) = heart_analysis::analyze_heart_rate_fft(
+                            &window.processed_signal,
+                            500.0,
+                            prev_hr,
+                            window.timestamp,
+                            &mut hr_history,
+                            &mut hr_fft_context,
+                            time_step,
+                            breathing_data,
+                            hr_outlier_percentile,
+                            hr_history_window,
+                            harmonic_penalty_close,
+                            harmonic_penalty_far,
+                            harmonic_close_threshold,
+                            harmonic_far_threshold,
+                            Some(median - 20.0),
+                            Some(median + 20.0),
+                        ) {
+                            final_heart_rates.push((window.timestamp, new_hr));
+                            prev_hr = Some(new_hr);
+                        }
+                    } else {
+                        // Keep original estimate
+                        if let Some((ts, hr)) = fft_heart_rates.get(i) {
+                            final_heart_rates.push((*ts, *hr));
+                            prev_hr = Some(*hr);
+                        }
+                    }
+                } else {
+                    // For later windows, keep original estimates
+                    if let Some((ts, hr)) = fft_heart_rates.get(i) {
+                        final_heart_rates.push((*ts, *hr));
+                        prev_hr = Some(*hr);
+                    }
+                }
+            }
+
+            fft_heart_rates = final_heart_rates;
         }
     }
 

@@ -125,6 +125,11 @@ impl HeartRateHistory {
         self.rates.retain(|(ts, _)| *ts >= cutoff);
     }
 
+    /// Clear all stored heart rate measurements
+    pub fn clear(&mut self) {
+        self.rates.clear();
+    }
+
     pub fn get_trend(&self) -> Option<f32> {
         if self.rates.len() < 2 {
             return None;
@@ -497,12 +502,20 @@ pub fn analyze_heart_rate_fft(
     harmonic_penalty_far: f32,
     harmonic_close_threshold: f32,
     harmonic_far_threshold: f32,
+    min_hr: Option<f32>,
+    max_hr: Option<f32>,
 ) -> Option<f32> {
     // Calculate initial range - broader when no history exists
     let (min_hr, max_hr) = if let Some(prev_hr) = prev_hr {
-        get_adaptive_hr_range(prev_hr, time_step)
+        // If min/max HR are provided, use them to constrain the adaptive range
+        let (adaptive_min, adaptive_max) = get_adaptive_hr_range(prev_hr, time_step);
+        (
+            min_hr.map_or(adaptive_min, |min| min.max(adaptive_min)),
+            max_hr.map_or(adaptive_max, |max| max.min(adaptive_max)),
+        )
     } else {
-        (40.0, 90.0) // Broader initial range
+        // No previous HR, use provided range or default
+        (min_hr.unwrap_or(40.0), max_hr.unwrap_or(90.0))
     };
 
     // Check both trend and physiological plausibility
