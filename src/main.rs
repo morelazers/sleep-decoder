@@ -275,7 +275,7 @@ fn analyse_sensor_data(
     // Second pass - conditionally reprocess early windows
     if let Some(median) = median_hr {
         const REPROCESS_THRESHOLD: f32 = 10.0; // BPM threshold for reprocessing
-        const EARLY_WINDOW_HOURS: i64 = 2;
+        const EARLY_WINDOW_HOURS: i64 = 3;
 
         // Clear history for second pass
         hr_history.clear();
@@ -322,7 +322,7 @@ fn analyse_sensor_data(
                             harmonic_close_threshold,
                             harmonic_far_threshold,
                             Some(median - 20.0),
-                            Some(median + 20.0),
+                            Some(median + 15.0),
                         ) {
                             final_heart_rates.push((window.timestamp, new_hr));
                             prev_hr = Some(new_hr);
