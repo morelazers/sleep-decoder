@@ -55,7 +55,7 @@ pub struct Args {
     pub csv_output: Option<String>,
 
     /// Window size for smoothing HR results
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "80")]
     pub hr_smoothing_window: usize,
 
     /// Heart rate window size in seconds
@@ -63,7 +63,7 @@ pub struct Args {
     pub hr_window_seconds: f32,
 
     /// Heart rate window overlap percentage (0.0 to 1.0)
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.67")]
     pub hr_window_overlap: f32,
 
     /// Breathing rate window size in seconds
@@ -79,15 +79,15 @@ pub struct Args {
     pub merge_sides: bool,
 
     /// Percentile threshold for HR outlier detection (0.0 to 0.5, default 0.05 means using 5th and 95th percentiles)
-    #[arg(long, default_value = "0.05")]
+    #[arg(long, default_value = "0.01")]
     pub hr_outlier_percentile: f32,
 
     /// Number of recent heart rate measurements to consider for outlier detection
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "180")]
     pub hr_history_window: usize,
 
     /// Base penalty for breathing harmonics when close to previous HR (0.0 to 1.0)
-    #[arg(long, default_value = "0.8")]
+    #[arg(long, default_value = "0.6")]
     pub harmonic_penalty_close: f32,
 
     /// Base penalty for breathing harmonics when far from previous HR (0.0 to 1.0)
