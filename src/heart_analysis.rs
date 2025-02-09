@@ -516,7 +516,7 @@ pub fn analyze_heart_rate_fft(
         )
     } else {
         // No previous HR, use provided range or default
-        (min_hr.unwrap_or(40.0), max_hr.unwrap_or(90.0))
+        (min_hr.unwrap_or(40.0), max_hr.unwrap_or(100.0))
     };
 
     // Check both trend and physiological plausibility

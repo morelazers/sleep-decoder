@@ -181,9 +181,22 @@ fn analyse_sensor_data(
     let mut hr_fft_context = heart_analysis::FftContext::new(samples_per_segment_hr);
     let mut hr_history = heart_analysis::HeartRateHistory::new(15.0 * 60.0);
 
-    // Process breathing rate windows first...
+    // Process breathing rate windows first, always using sensor 1...
+    let br_signal: Vec<i32> = (0..raw_data.len())
+        .filter_map(|idx| raw_data.get_data_at(idx))
+        .map(|data| {
+            // Always use sensor 1 for breathing
+            if signal.first().map(|&s| s == data.left1[0]).unwrap_or(false) {
+                data.left1.to_vec()
+            } else {
+                data.right1.to_vec()
+            }
+        })
+        .flatten()
+        .collect();
+
     let br_windows = heart_analysis::SignalWindowIterator::new(
-        signal,
+        &br_signal,
         raw_data,
         samples_per_segment_br,
         step_size_br,
