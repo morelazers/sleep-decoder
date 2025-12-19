@@ -523,14 +523,6 @@ pub fn analyze_heart_rate_fft(
     if let Some(prev_hr) = prev_hr {
         // Check overall trend with more stringent validation for higher rates
         if let Some(trend) = history.get_trend() {
-            // Note: max_allowed_trend is computed for potential future use but validation
-            // is currently done through validate_rate_of_change
-            let _max_allowed_trend = if prev_hr > 80.0 || trend > 0.0 {
-                0.8 // More conservative for high rates or increasing trends
-            } else {
-                1.2 // Original value for decreasing trends at normal rates
-            };
-
             if !validate_rate_of_change(trend, trend < 0.0) {
                 debug!("Trend too steep ({:.2} BPM/min), being conservative", trend);
                 let smoothed_bpm = prev_hr;
