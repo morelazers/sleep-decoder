@@ -150,7 +150,7 @@ pub fn remove_time_outliers(data: &mut Vec<ProcessedData>) {
     println!("Remaining rows: {}", data.len());
 }
 
-pub fn scale_data(data: &mut Vec<ProcessedData>) {
+pub fn scale_data(data: &mut [ProcessedData]) {
     // Helper functions remain the same
     fn median(values: &[f32]) -> f32 {
         let mut sorted = values.to_vec();

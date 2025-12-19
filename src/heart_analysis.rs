@@ -41,7 +41,7 @@ impl<'a> SignalWindowIterator<'a> {
     }
 }
 
-impl<'a> Iterator for SignalWindowIterator<'a> {
+impl Iterator for SignalWindowIterator<'_> {
     type Item = SignalWindow;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -241,7 +241,7 @@ fn design_notch_peak_filter(mut w0: f32, q: f32, ftype: &str, fs: f32) -> (Vec<f
     let mut bw = w0 / q;
 
     // Normalize inputs
-    bw = bw * PI;
+    bw *= PI;
     let w0 = w0 * PI;
 
     assert!(ftype == "notch" || ftype == "peak", "Unknown ftype");
@@ -254,12 +254,12 @@ fn design_notch_peak_filter(mut w0: f32, q: f32, ftype: &str, fs: f32) -> (Vec<f
 
     // Compute numerator b and denominator a
     let b = if ftype == "notch" {
-        vec![1.0, -2.0 * w0.cos(), 1.0]
+        [1.0, -2.0 * w0.cos(), 1.0]
             .iter()
             .map(|x| x * gain)
             .collect()
     } else {
-        vec![1.0, 0.0, -1.0]
+        [1.0, 0.0, -1.0]
             .iter()
             .map(|x| x * (1.0 - gain))
             .collect()
@@ -422,7 +422,7 @@ fn calculate_harmonic_penalty(
     let mut penalty = if let Some((br, stability)) = breathing_data {
         // Calculate breathing harmonics
         let fundamental = br / 60.0; // Convert BPM to Hz
-        let harmonics = vec![
+        let harmonics = [
             fundamental * 2.0, // Second harmonic
             fundamental * 3.0, // Third harmonic
             fundamental * 4.0, // Fourth harmonic
@@ -523,12 +523,6 @@ pub fn analyze_heart_rate_fft(
     if let Some(prev_hr) = prev_hr {
         // Check overall trend with more stringent validation for higher rates
         if let Some(trend) = history.get_trend() {
-            let max_allowed_trend = if prev_hr > 80.0 || trend > 0.0 {
-                0.8 // More conservative for high rates or increasing trends
-            } else {
-                1.2 // Original value for decreasing trends at normal rates
-            };
-
             if !validate_rate_of_change(trend, trend < 0.0) {
                 debug!("Trend too steep ({:.2} BPM/min), being conservative", trend);
                 let smoothed_bpm = prev_hr;
@@ -549,9 +543,9 @@ pub fn analyze_heart_rate_fft(
     // Find peaks with enhanced validation
     let mut peaks = Vec::new();
     for bin in min_bin + 1..=max_bin - 1 {
-        let magnitude = (buffer[bin].norm_sqr() as f32).sqrt();
-        let prev_magnitude = (buffer[bin - 1].norm_sqr() as f32).sqrt();
-        let next_magnitude = (buffer[bin + 1].norm_sqr() as f32).sqrt();
+        let magnitude = buffer[bin].norm_sqr().sqrt();
+        let prev_magnitude = buffer[bin - 1].norm_sqr().sqrt();
+        let next_magnitude = buffer[bin + 1].norm_sqr().sqrt();
 
         if magnitude > prev_magnitude && magnitude > next_magnitude {
             let freq = bin as f32 * freq_resolution;
@@ -676,7 +670,7 @@ pub fn analyze_heart_rate_fft(
         peaks
             .first()
             .map(|&(bpm, _)| bpm)
-            .filter(|&bpm| bpm >= 40.0 && bpm <= 100.0)
+            .filter(|&bpm| (40.0..=100.0).contains(&bpm))
     };
 
     // Add to history if we found a valid rate
@@ -716,7 +710,7 @@ pub fn analyze_breathing_rate_fft(
     let mut peak_freq = 0.0;
 
     for bin in min_bin..=max_bin {
-        let magnitude = (buffer[bin].norm_sqr() as f32).sqrt();
+        let magnitude = buffer[bin].norm_sqr().sqrt();
         if magnitude > max_magnitude {
             max_magnitude = magnitude;
             peak_freq = bin as f32 * freq_resolution;
@@ -726,7 +720,7 @@ pub fn analyze_breathing_rate_fft(
     // Convert peak frequency to breaths per minute
     let breaths_per_minute = peak_freq * 60.0;
 
-    if breaths_per_minute >= 8.0 && breaths_per_minute <= 20.0 {
+    if (8.0..=20.0).contains(&breaths_per_minute) {
         Some(breaths_per_minute)
     } else {
         None
@@ -930,11 +924,9 @@ pub fn compare_sensor_analysis<'a>(
 
 /// Score a sensor's output based on physiological plausibility and consistency
 fn score_sensor_output(median: f32, variance: f32) -> f32 {
-    let mut score = 0.0;
-
     // Factor 1: Median HR should be in a reasonable range for sleep
     // Ideal sleeping HR is typically between 50-70 BPM
-    let median_score = if median >= 45.0 && median <= 85.0 {
+    let median_score = if (45.0..=85.0).contains(&median) {
         // Higher score for values closer to the ideal range
         let distance_from_ideal = if median < 50.0 {
             (median - 50.0).abs()
@@ -953,7 +945,5 @@ fn score_sensor_output(median: f32, variance: f32) -> f32 {
     let variance_score = 1.0 - (variance / 200.0).min(1.0);
 
     // Combine scores (currently weighted equally)
-    score = median_score * 0.6 + variance_score * 0.4;
-
-    score
+    median_score * 0.6 + variance_score * 0.4
 }

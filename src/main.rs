@@ -2,7 +2,6 @@ use anyhow::Result;
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use env_logger;
 use serde::Deserialize;
 use sleep_decoder::{
     config::{Args, SensorSelection},
@@ -184,7 +183,7 @@ fn analyse_sensor_data(
     // Process breathing rate windows first, always using sensor 1...
     let br_signal: Vec<i32> = (0..raw_data.len())
         .filter_map(|idx| raw_data.get_data_at(idx))
-        .map(|data| {
+        .flat_map(|data| {
             // Always use sensor 1 for breathing
             if signal.first().map(|&s| s == data.left1[0]).unwrap_or(false) {
                 data.left1.to_vec()
@@ -192,7 +191,6 @@ fn analyse_sensor_data(
                 data.right1.to_vec()
             }
         })
-        .flatten()
         .collect();
 
     let br_windows = heart_analysis::SignalWindowIterator::new(
@@ -250,7 +248,7 @@ fn analyse_sensor_data(
         let breathing_data = breathing_rates_with_stability
             .iter()
             .min_by_key(|(br_time, _, _)| {
-                (br_time.timestamp() - window.timestamp.timestamp()).abs() as u64
+                (br_time.timestamp() - window.timestamp.timestamp()).unsigned_abs()
             })
             .map(|(_, rate, stability)| (*rate, *stability));
 
@@ -318,8 +316,7 @@ fn analyse_sensor_data(
                             let breathing_data = breathing_rates_with_stability
                                 .iter()
                                 .min_by_key(|(br_time, _, _)| {
-                                    (br_time.timestamp() - window.timestamp.timestamp()).abs()
-                                        as u64
+                                    (br_time.timestamp() - window.timestamp.timestamp()).unsigned_abs()
                                 })
                                 .map(|(_, rate, stability)| (*rate, *stability));
 
@@ -432,14 +429,12 @@ fn analyze_bed_presence_periods(
             // Run analysis on both sensors
             let signal1: Vec<i32> = (0..raw_data_view.len())
                 .filter_map(|idx| raw_data_view.get_data_at(idx))
-                .map(|data| data.left1.to_vec())
-                .flatten()
+                .flat_map(|data| data.left1.to_vec())
                 .collect();
 
             let signal2: Vec<i32> = (0..raw_data_view.len())
                 .filter_map(|idx| raw_data_view.get_data_at(idx))
-                .map(|data| data.left2.unwrap_or_default().to_vec())
-                .flatten()
+                .flat_map(|data| data.left2.unwrap_or_default().to_vec())
                 .collect();
 
             // Analyze both sensors
@@ -477,27 +472,25 @@ fn analyze_bed_presence_periods(
 
             // Compare and choose the better analysis
             heart_analysis::compare_sensor_analysis(&analysis1, &analysis2)
-                .map(|analysis| analysis.clone())
+                .cloned()
                 .unwrap_or(analysis1)
         } else {
             // Extract signal based on sensor selection
             let mut signal: Vec<i32> = (0..raw_data_view.len())
                 .filter_map(|idx| raw_data_view.get_data_at(idx))
-                .map(|data| match args.sensor {
+                .flat_map(|data| match args.sensor {
                     Some(SensorSelection::First) => data.left1.to_vec(),
                     Some(SensorSelection::Second) => data.left2.unwrap_or_default().to_vec(),
                     Some(SensorSelection::Combined) | None => data.left.to_vec(),
                     Some(SensorSelection::Choose) => unreachable!(),
                 })
-                .flatten()
                 .collect();
 
             // Rest of the existing analysis code...
             if args.merge_sides {
                 let right_signal: Vec<i32> = (0..raw_data_view.len())
                     .filter_map(|idx| raw_data_view.get_data_at(idx))
-                    .map(|data| data.right.to_vec())
-                    .flatten()
+                    .flat_map(|data| data.right.to_vec())
                     .collect();
 
                 // Average the signals
@@ -559,14 +552,12 @@ fn analyze_bed_presence_periods(
                 // Run analysis on both sensors
                 let signal1: Vec<i32> = (0..raw_data_view.len())
                     .filter_map(|idx| raw_data_view.get_data_at(idx))
-                    .map(|data| data.right1.to_vec())
-                    .flatten()
+                    .flat_map(|data| data.right1.to_vec())
                     .collect();
 
                 let signal2: Vec<i32> = (0..raw_data_view.len())
                     .filter_map(|idx| raw_data_view.get_data_at(idx))
-                    .map(|data| data.right2.unwrap_or_default().to_vec())
-                    .flatten()
+                    .flat_map(|data| data.right2.unwrap_or_default().to_vec())
                     .collect();
 
                 // Analyze both sensors
@@ -604,19 +595,18 @@ fn analyze_bed_presence_periods(
 
                 // Compare and choose the better analysis
                 heart_analysis::compare_sensor_analysis(&analysis1, &analysis2)
-                    .map(|analysis| analysis.clone())
+                    .cloned()
                     .unwrap_or(analysis1)
             } else {
                 // Extract signal based on sensor selection
                 let signal: Vec<i32> = (0..raw_data_view.len())
                     .filter_map(|idx| raw_data_view.get_data_at(idx))
-                    .map(|data| match args.sensor {
+                    .flat_map(|data| match args.sensor {
                         Some(SensorSelection::First) => data.right1.to_vec(),
                         Some(SensorSelection::Second) => data.right2.unwrap_or_default().to_vec(),
                         Some(SensorSelection::Combined) | None => data.right.to_vec(),
                         Some(SensorSelection::Choose) => unreachable!(),
                     })
-                    .flatten()
                     .collect();
 
                 analyse_sensor_data(
@@ -789,8 +779,7 @@ fn main() -> Result<()> {
     // Process all sensor data at once
     let mut all_processed_data: Vec<ProcessedData> = raw_sensor_data
         .iter()
-        .map(|(_, data)| preprocessing::process_piezo_data(data))
-        .flatten()
+        .filter_map(|(_, data)| preprocessing::process_piezo_data(data))
         .collect();
 
     // First remove time outliers
