@@ -32,7 +32,7 @@ pub fn write_analysis_to_csv(
     let mut writer = csv::Writer::from_writer(file);
 
     // Write header
-    writer.write_record(&[
+    writer.write_record([
         "timestamp",
         "fft_hr_smoothed",
         "breathing_rate",
@@ -50,7 +50,6 @@ pub fn write_analysis_to_csv(
     );
 
     // Use breathing rate timestamps as the primary timeline
-    let br_timestamps: Vec<_> = analysis.breathing_rates.iter().map(|(t, _)| t).collect();
 
     // For each breathing rate timestamp, find or interpolate the corresponding heart rate
     for (br_timestamp, br) in &analysis.breathing_rates {

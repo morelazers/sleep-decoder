@@ -372,9 +372,9 @@ pub fn read_feather_file(path: &PathBuf) -> Result<Vec<(u32, CombinedSensorData)
                 let combined = CombinedSensorData {
                     ts,
                     left1: left1.clone(),
-                    left2: left2,
+                    left2,
                     right1: right1.clone(),
-                    right2: right2,
+                    right2,
                     left,
                     right,
                 };

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use arrow::ipc::reader::{FileReader, FileReaderBuilder};
+use arrow::ipc::reader::FileReaderBuilder;
 use std::fs::File;
 
 fn main() -> Result<()> {

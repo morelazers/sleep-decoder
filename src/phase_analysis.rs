@@ -33,7 +33,6 @@ pub fn analyze_sleep_phases(
 
     let mut current_phase = SleepPhase::Light; // Always start with Light sleep
     let mut phase_start_time = sleep_onset;
-    let mut last_phase_change = sleep_onset;
 
     // Analyze sliding windows
     for window in post_onset_breathing.windows(window_size) {
@@ -95,7 +94,6 @@ pub fn analyze_sleep_phases(
 
         if next_phase != current_phase {
             phase_start_time = time;
-            last_phase_change = time;
         }
         current_phase = next_phase;
         phases.push((time, current_phase));
